@@ -1,0 +1,26 @@
+[package]
+name = "heartbeat-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Stop hook for autonomous Claude Code agent loops — drain a message inbox across turns without a persistent process"
+license = "MIT"
+repository = "https://github.com/gabaum10/heartbeat-rs"
+authors = ["Geoff Baum <gabaum10@gmail.com>"]
+keywords = ["claude", "ai", "agent", "hook", "automation"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "heartbeat-stop"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "heartbeat_rs"
+path = "src/lib.rs"

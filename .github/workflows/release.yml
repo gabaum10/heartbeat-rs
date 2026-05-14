@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format check
+        run: cargo fmt -- --check
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [test]
+    permissions:
+      contents: write
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
+    environment: Crate Deploy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BUMP_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Auto-bump patch version if already published
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          CRATE_JSON=$(curl -sf -H "User-Agent: heartbeat-rs-ci (github.com/gabaum10/heartbeat-rs)" https://crates.io/api/v1/crates/heartbeat-rs)
+          if [ $? -ne 0 ] || [ -z "$CRATE_JSON" ]; then
+            echo "WARNING: Failed to query crates.io API"
+            PUBLISHED="none"
+          else
+            PUBLISHED=$(echo "$CRATE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['crate']['newest_version'])" 2>&1) || PUBLISHED="none"
+          fi
+          echo "Local version:     $VERSION"
+          echo "Published version: $PUBLISHED"
+          if [ "$VERSION" = "$PUBLISHED" ]; then
+            echo "Version already published -- bumping patch..."
+            MAJOR=$(echo $VERSION | cut -d. -f1)
+            MINOR=$(echo $VERSION | cut -d. -f2)
+            PATCH=$(echo $VERSION | cut -d. -f3)
+            NEW_PATCH=$((PATCH + 1))
+            NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+            echo "New version: $NEW_VERSION"
+            sed -i "s/^version = \"$VERSION\"/version = \"$NEW_VERSION\"/" Cargo.toml
+            cargo generate-lockfile
+            cargo check
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore: bump version to $NEW_VERSION [skip ci]"
+            git push
+          else
+            echo "Version not yet published -- proceeding with $VERSION"
+          fi
+      - name: Publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
