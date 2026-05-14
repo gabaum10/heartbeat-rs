@@ -109,7 +109,7 @@ fn read_offset(offset_file: &Path) -> Option<u64> {
 }
 
 /// Writes the byte offset to the offset file with fsync for crash safety.
-fn write_offset(offset_file: &Path, offset: u64) -> io::Result<()> {
+pub fn write_offset(offset_file: &Path, offset: u64) -> io::Result<()> {
     let tmp = offset_file.with_extension("tmp");
     {
         let mut f = fs::File::create(&tmp)?;

@@ -85,11 +85,41 @@ echo "$PROMPT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().
 
 The hook detects the leading `"` and unwraps the JSON string before delivery, so Claude receives the original multi-line content.
 
-## Typical Session Flow
+## Architecture: Launcher + Hook
+
+`heartbeat-rs` is the automation layer, not the launcher. Each consumer writes a wrapper script that handles their specific trigger and launches the session. The crate handles everything after launch.
 
 ```
-1. External script writes a prompt to inbox.jsonl
-2. Session launches: claude --allowedTools "..." "Read CLAUDE.md"
+┌─────────────────────────┐
+│  LAUNCHER (your script) │  Polls for work, writes to inbox, starts claude
+└───────────┬─────────────┘
+            │ launches interactive session
+┌───────────▼─────────────┐
+│  CLAUDE CODE SESSION    │  Reads CLAUDE.md, responds
+└───────────┬─────────────┘
+            │ stop hook fires after every response
+┌───────────▼─────────────┐
+│  heartbeat-stop (hook)  │  Reads inbox, delivers or drains
+└─────────────────────────┘
+```
+
+**The launcher is load-bearing.** It's where you poll for new work (IMAP, ticket API, file watcher), format the prompt, write to the inbox, and start `claude`. Different use cases write different launchers. The hook binary is the same everywhere.
+
+Example launcher (systemd timer + email triage):
+
+```bash
+#!/bin/bash
+EMAILS=$(poll-imap --once)
+echo "$EMAILS" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' >> /path/to/inbox.jsonl
+cd /path/to/agent/workspace
+claude --append-system-prompt-file agent.md "Read CLAUDE.md"
+```
+
+## Session Flow
+
+```
+1. Launcher writes prompt to inbox.jsonl
+2. Launcher starts: claude --allowedTools "..." "Read CLAUDE.md"
 3. Claude reads CLAUDE.md, responds
 4. Stop hook fires: reads inbox.jsonl, delivers prompt, blocks stop
 5. Claude processes the prompt, executes tool calls, responds
