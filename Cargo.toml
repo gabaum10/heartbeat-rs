@@ -1,6 +1,6 @@
 [package]
 name = "heartbeat-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Stop hook for autonomous Claude Code agent loops — drain a message inbox across turns without a persistent process"
 license = "MIT"
