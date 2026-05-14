@@ -1,19 +1,26 @@
 # heartbeat-rs
 
-A focused Rust stop hook for autonomous Claude Code agent loops — keeps a headless `-p` session alive while an inbox has messages, then exits cleanly.
+A Rust stop hook for autonomous Claude Code agent loops. Drains a JSONL message inbox across multiple agent turns without a persistent supervisor process.
 
-## The Problem
+## What It Does
 
-Anthropic's June 2026 SDK credit separation means `claude -p` (non-interactive dispatch) and interactive sessions now draw from separate credit pools. Headless `-p` calls that need to remain interactive — reading messages, executing tools across multiple turns — can't easily be kept alive without a persistent process or a polling loop. `heartbeat-rs` solves this without either: it runs as a Claude Code `Stop` hook, inspecting a message inbox after every agent turn and either injecting the next message or approving the session's exit.
+Claude Code supports a [stop hook](https://docs.anthropic.com/en/docs/claude-code/hooks) -- a command that runs after every agent response and controls whether the session continues or ends. `heartbeat-rs` implements a message-queue dispatch pattern on top of this hook:
+
+1. An external process writes prompts to a JSONL inbox file.
+2. Claude Code starts an interactive session.
+3. After each agent response, the stop hook reads the next message from the inbox and injects it as the next user turn.
+4. When the inbox is empty, the hook approves the stop and the session exits cleanly.
+
+This turns Claude Code's interactive session model into a message-driven automation runtime. Each session gets full tool access, clean context, and the same execution environment as a human-operated session -- but the messages come from a file queue instead of a keyboard.
 
 ## How It Works
 
-Claude Code's `.claude/settings.json` supports a `Stop` hook — a command that runs after every Claude response. The hook's stdout determines what happens next:
+Claude Code's `.claude/settings.json` supports a `Stop` hook. The hook's stdout determines what happens next:
 
-- Output `{"decision":"block","reason":"<message>"}` — the session continues; `reason` becomes the next user turn.
-- Output nothing — the session ends (stop approved).
+- Output `{"decision":"block","reason":"<message>"}` -- the session continues; `reason` becomes the next user turn.
+- Output nothing -- the session ends (stop approved).
 
-`heartbeat-stop` implements a state machine around this protocol. It reads from a JSONL inbox file at a byte offset, tracking position atomically so messages are never re-delivered. A `.responded` flag file bridges turns: when a message is delivered, the flag is created; on the next invocation the hook sees the flag, removes it, and checks whether another message is waiting. If yes, deliver and block again. If no, approve — the session exits cleanly.
+`heartbeat-stop` implements a state machine around this protocol. It reads from a JSONL inbox file at a byte offset, tracking position atomically so messages are never re-delivered. A `.responded` flag file bridges turns: when a message is delivered, the flag is created; on the next invocation the hook sees the flag, removes it, and checks whether another message is waiting. If yes, deliver and block again. If no, approve -- the session exits cleanly.
 
 ## Installation
 
@@ -43,8 +50,8 @@ heartbeat-stop --inbox /path/to/inbox.jsonl --mode persist
 
 | Mode | Behavior |
 |------|----------|
-| `drain` | Approves stop when the inbox is empty. Use for timer-triggered or fresh-per-event sessions — the agent runs until all queued messages are processed, then exits. |
-| `persist` | Sends idle ticks when the inbox is empty, keeping the session alive indefinitely. Use for a persistent supervisor pattern. |
+| `drain` | Approves stop when the inbox is empty. The agent processes all queued messages, then exits. Use for timer-triggered dispatch, batch processing, or single-event sessions. |
+| `persist` | Sends idle ticks when the inbox is empty, keeping the session alive indefinitely. Use for long-running supervisor patterns where new messages may arrive at any time. |
 
 ## Configuration
 
@@ -87,7 +94,7 @@ The hook detects the leading `"` and unwraps the JSON string before delivery, so
 
 ## Architecture: Launcher + Hook
 
-`heartbeat-rs` is the automation layer, not the launcher. Each consumer writes a wrapper script that handles their specific trigger and launches the session. The crate handles everything after launch.
+`heartbeat-rs` is the dispatch layer, not the launcher. Each consumer writes a wrapper script that handles their specific trigger and starts the session. The crate handles everything after launch.
 
 ```
 ┌─────────────────────────┐
@@ -103,22 +110,33 @@ The hook detects the leading `"` and unwraps the JSON string before delivery, so
 └─────────────────────────┘
 ```
 
-**The launcher is load-bearing.** It's where you poll for new work (IMAP, ticket API, file watcher), format the prompt, write to the inbox, and start `claude`. Different use cases write different launchers. The hook binary is the same everywhere.
+**The launcher is load-bearing.** It's where you poll for new work (IMAP, ticket API, file watcher, CI webhook), format the prompt, write to the inbox, and start `claude`. Different use cases write different launchers. The hook binary is the same everywhere.
 
-Example launcher (systemd timer + email triage):
+### Example: Timer-Triggered Email Triage
 
 ```bash
 #!/bin/bash
+# Runs on a systemd timer or cron schedule
 EMAILS=$(poll-imap --once)
 echo "$EMAILS" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' >> /path/to/inbox.jsonl
 cd /path/to/agent/workspace
-claude --append-system-prompt-file agent.md "Read CLAUDE.md"
+claude --allowedTools "..." "Read CLAUDE.md"
+```
+
+### Example: Event-Driven CI Integration
+
+```bash
+#!/bin/bash
+# Triggered by a webhook or file watch
+echo "Review the PR diff at $PR_URL and check for security issues" >> /path/to/inbox.jsonl
+cd /path/to/agent/workspace
+claude --allowedTools "Bash,Read" "Read CLAUDE.md"
 ```
 
 ## Session Flow
 
 ```
-1. Launcher writes prompt to inbox.jsonl
+1. Launcher writes prompt(s) to inbox.jsonl
 2. Launcher starts: claude --allowedTools "..." "Read CLAUDE.md"
 3. Claude reads CLAUDE.md, responds
 4. Stop hook fires: reads inbox.jsonl, delivers prompt, blocks stop
@@ -141,17 +159,25 @@ claude --append-system-prompt-file agent.md "Read CLAUDE.md"
 
 The `.responded` flag lets the hook drain a queue across multiple agent turns without keeping a supervisor process alive.
 
+## Use Cases
+
+- **Timer-driven automation.** A cron job or systemd timer polls for work, queues prompts, and launches a session that processes them and exits.
+- **Event-driven processing.** A webhook handler or file watcher writes to the inbox; the session handles the event and shuts down.
+- **Batch dispatch.** Queue multiple prompts, launch once, drain them all in sequence with clean context boundaries between messages.
+- **CI/CD integration.** Trigger agent sessions from pipeline steps for code review, test analysis, or deployment verification.
+- **Persistent supervisor.** In `persist` mode, keep a session alive to handle messages as they arrive over an extended period.
+
 ## Security Notes
 
 - No network access. Reads one local file, writes one flag file and one offset file.
-- Byte offset is written atomically with `fsync` and a rename — crash-safe, no torn writes.
+- Byte offset is written atomically with `fsync` and a rename -- crash-safe, no torn writes.
 - On IO error, the hook approves the stop (fail-open) and logs to stderr. Safer than blocking indefinitely.
 - Inbox content is delivered verbatim to Claude. Sanitize prompts at the write site.
 
 ## Credits
 
-Inspired by [claude-heartbeat](https://github.com/Siigari/claude-heartbeat). The core algorithm — byte-offset JSONL consumption, `.responded` flag state machine, block/approve protocol — is adapted from that project's JS implementation. This crate extracts the essential stop hook primitive as a focused, dependency-minimal Rust binary with hardened IO and a test suite.
+Inspired by [claude-heartbeat](https://github.com/Siigari/claude-heartbeat). The core algorithm -- byte-offset JSONL consumption, `.responded` flag state machine, block/approve protocol -- is adapted from that project's JS implementation. This crate extracts the stop hook primitive as a focused, dependency-minimal Rust binary with hardened IO and a test suite.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT -- see [LICENSE](LICENSE).
