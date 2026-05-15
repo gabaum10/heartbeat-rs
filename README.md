@@ -20,7 +20,9 @@ Claude Code's `.claude/settings.json` supports a `Stop` hook. The hook's stdout 
 - Output `{"decision":"block","reason":"<message>"}` -- the session continues; `reason` becomes the next user turn.
 - Output nothing -- the session ends (stop approved).
 
-`heartbeat-stop` implements a state machine around this protocol. It reads from a JSONL inbox file at a byte offset, tracking position atomically so messages are never re-delivered. A `.responded` flag file bridges turns: when a message is delivered, the flag is created; on the next invocation the hook sees the flag, removes it, and checks whether another message is waiting. If yes, deliver and block again. If no, approve -- the session exits cleanly.
+`heartbeat-stop` implements a state machine around this protocol. It reads from a JSONL inbox file at a byte offset. A `.responded` flag file bridges turns, and a `.in-flight` artifact bridges sessions.
+
+**Fix B (current):** The offset cursor is deferred -- it advances only when the agent acknowledges an entry (on the next hook tick), not when the entry is first read. This eliminates the silent-drop window where a launcher or agent crash between delivery and acknowledgement would lose the entry. A `.in-flight` file records the entry in transit so crash recovery can distinguish stale orphans from live ones.
 
 ## Installation
 
@@ -42,8 +44,14 @@ cp target/release/heartbeat-stop ~/.local/bin/
 ## Usage
 
 ```bash
+# Stop hook (call from .claude/settings.json)
 heartbeat-stop --inbox /path/to/inbox.jsonl --mode drain
 heartbeat-stop --inbox /path/to/inbox.jsonl --mode persist
+
+# Orphan recovery (call from your launcher before resetting the inbox)
+heartbeat-stop recover --inbox /path/to/inbox.jsonl --on-orphan deadletter
+heartbeat-stop recover --inbox /path/to/inbox.jsonl --on-orphan retry
+heartbeat-stop recover --inbox /path/to/inbox.jsonl --on-orphan drop
 ```
 
 ## Modes
@@ -116,9 +124,20 @@ The hook detects the leading `"` and unwraps the JSON string before delivery, so
 
 ```bash
 #!/bin/bash
-# Runs on a systemd timer or cron schedule
+AGENT_DIR="/path/to/agent"
+INBOX="$AGENT_DIR/inbox.jsonl"
+
+# Step 1: recover any orphan from a prior crashed session BEFORE resetting.
+# Use 'drop' if your upstream source (e.g., IMAP) is the retry mechanism.
+heartbeat-stop recover --inbox "$INBOX" --on-orphan drop 2>> triage.log || true
+
+# Step 2: reset inbox for fresh cycle.
+> "$INBOX"
+echo -n "0" > "$AGENT_DIR/.inbox-offset"
+
+# Step 3: write new work and launch.
 EMAILS=$(poll-imap --once)
-echo "$EMAILS" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' >> /path/to/inbox.jsonl
+echo "$EMAILS" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' >> "$INBOX"
 cd /path/to/agent/workspace
 claude --allowedTools "..." "Read CLAUDE.md"
 ```
@@ -127,37 +146,101 @@ claude --allowedTools "..." "Read CLAUDE.md"
 
 ```bash
 #!/bin/bash
-# Triggered by a webhook or file watch
-echo "Review the PR diff at $PR_URL and check for security issues" >> /path/to/inbox.jsonl
+AGENT_DIR="/path/to/agent"
+INBOX="$AGENT_DIR/inbox.jsonl"
+
+# Recover before reset. Use 'deadletter' if duplicate processing is unacceptable.
+heartbeat-stop recover --inbox "$INBOX" --on-orphan deadletter 2>> ci.log || true
+
+echo "Review the PR diff at $PR_URL and check for security issues" >> "$INBOX"
 cd /path/to/agent/workspace
 claude --allowedTools "Bash,Read" "Read CLAUDE.md"
 ```
 
-## Session Flow
+## State Machine (drain mode — Fix B)
 
 ```
-1. Launcher writes prompt(s) to inbox.jsonl
-2. Launcher starts: claude --allowedTools "..." "Read CLAUDE.md"
-3. Claude reads CLAUDE.md, responds
-4. Stop hook fires: reads inbox.jsonl, delivers prompt, blocks stop
-5. Claude processes the prompt, executes tool calls, responds
-6. Stop hook fires: .responded flag exists, inbox now empty, approves stop
-7. Session exits cleanly
+Per-entry lifecycle:
+
+  [queued]      offset < EOF, no .in-flight
+      |
+      | hook reads entry, writes .in-flight, touches .responded
+      v
+  [in-flight]   .in-flight exists, .responded exists, offset at entry start
+      |
+      | agent responds, hook fires next tick
+      v
+  [acknowledged] hook advances offset, removes .in-flight + .responded
+      |
+      | hook reads next entry or approves stop
+      v
+  [completed]   offset past entry, no on-disk state
 ```
 
-## State Machine (drain mode)
+The `.responded` flag bridges turns. The `.in-flight` artifact bridges sessions.
 
-```
-1. If .responded flag exists:
-   - Remove it
-   - If inbox has another message: deliver it, set .responded, block
-   - If inbox is empty: approve (session ends)
-2. If no .responded flag:
-   - If inbox has a message: deliver it, set .responded, block
-   - If inbox is empty: approve (session ends)
+**Key difference from the original design:** the offset cursor does NOT advance on read. It advances on acknowledge (the next hook tick after the agent responds). This means:
+
+- If the launcher or agent crashes between delivery and acknowledgement, the entry is NOT silently lost.
+- At next startup, `.in-flight` is present and the launcher can apply recovery policy.
+- The cursor value now means "everything before this byte was **acknowledged**," not just "delivered."
+
+## Orphan Recovery
+
+When a session ends without completing an acknowledgement (launcher killed, agent timeout, hook IO error), the `.in-flight` file persists. The next launcher cycle must check for it before resetting the inbox.
+
+Call `heartbeat-stop recover` before truncating the inbox:
+
+```bash
+heartbeat-stop recover --inbox "$INBOX" --on-orphan deadletter
 ```
 
-The `.responded` flag lets the hook drain a queue across multiple agent turns without keeping a supervisor process alive.
+### Orphan Policies (`--on-orphan`)
+
+| Policy | Behavior | Use when |
+|--------|----------|----------|
+| `deadletter` (default) | Appends orphan to `.dead-letter.jsonl`, advances cursor | Duplicate side effects are unacceptable; operator reviews dead-letter |
+| `retry` | Prepends orphan back to inbox as first entry | Work is idempotent, or the agent never actually saw the entry |
+| `drop` | Deletes `.in-flight`, advances cursor | Upstream source (IMAP, ticket API) is the retry mechanism |
+
+### Stale vs. Live Orphans
+
+`recover` distinguishes two cases automatically:
+
+- **Live orphan** — cursor is at `start_offset` (entry was never acknowledged). Apply the configured policy.
+- **Stale orphan** — cursor has already advanced past `end_offset` (entry was acknowledged in a prior step, but `.in-flight` removal was interrupted). Silently delete `.in-flight`. No policy needed.
+
+## On-Disk Artifacts
+
+| File | Purpose | Lifecycle |
+|------|---------|-----------|
+| `inbox.jsonl` | The message queue | Written by launcher, read by hook |
+| `.inbox-offset` | Byte cursor (acknowledged position) | Written by hook on acknowledge |
+| `.responded` | "Agent just replied" signal | Touched on delivery, removed on next tick |
+| `.in-flight` | Entry currently being processed | Written on delivery, removed on acknowledge |
+| `.dead-letter.jsonl` | Orphans moved by deadletter policy | Append-only; operator drains manually |
+
+**IMPORTANT for launcher authors:** Do NOT delete `.in-flight` in your failure branch. If `claude` exits non-zero, preserve `.in-flight` and let the next cycle's `recover` call handle it. Deleting `.in-flight` in the failure path defeats the entire safety property of Fix B.
+
+```bash
+# WRONG: this silently drops the orphan
+if cd "$WORKSPACE" && claude ...; then
+    # success
+else
+    rm -f "$AGENT_DIR/.in-flight"  # DON'T DO THIS
+fi
+
+# RIGHT: let the next cycle's recover call handle the orphan
+if cd "$WORKSPACE" && claude ...; then
+    # success
+else
+    echo "session failed — orphan will be handled on next cycle" >> "$LOG"
+fi
+# At the top of the next cycle:
+heartbeat-stop recover --inbox "$INBOX" --on-orphan deadletter
+```
+
+**IMPORTANT:** Each consumer must use its own `$AGENT_DIR`. Two launchers sharing the same inbox directory will corrupt each other's state. One directory, one consumer, full stop.
 
 ## Use Cases
 
@@ -171,6 +254,7 @@ The `.responded` flag lets the hook drain a queue across multiple agent turns wi
 
 - No network access. Reads one local file, writes one flag file and one offset file.
 - Byte offset is written atomically with `fsync` and a rename -- crash-safe, no torn writes.
+- `.in-flight` is written atomically (tmp + fsync + rename). Same crash safety.
 - On IO error, the hook approves the stop (fail-open) and logs to stderr. Safer than blocking indefinitely.
 - Inbox content is delivered verbatim to Claude. Sanitize prompts at the write site.
 

@@ -4,4 +4,6 @@
 //! Expose them here for testing and potential reuse.
 
 pub mod hook;
+pub mod in_flight;
 pub mod inbox;
+pub mod recover;
