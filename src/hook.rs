@@ -440,15 +440,9 @@ mod tests {
         let cur = inbox::read_offset(&offset(&dir)).unwrap();
         let inf = InFlightEntry::read_from(&in_flight(&dir)).unwrap().unwrap();
 
-        // Stale: cursor at end_offset is NOT stale (equal), but > end_offset is.
-        // The spec says "cursor > end_offset → stale". At cursor == end_offset,
-        // the entry was fully acknowledged (cursor points past the line).
-        // is_stale checks `current_offset > self.end_offset`.
-        // cursor == end_offset → not stale by our definition, but the entry
-        // IS effectively acknowledged. Launcher should handle this edge case
-        // by checking `current_offset >= end_offset`.
-        assert!(!inf.is_stale(cur)); // cursor == end_offset, is_stale = false
-        // Launcher's recovery check should be: if cursor >= end_offset → stale.
+        // cursor == end_offset: entry is fully past the cursor.
+        // is_stale uses >= so this is correctly detected as stale.
+        assert!(inf.is_stale(cur), "cursor at end_offset must be detected as stale");
         assert!(cur >= inf.end_offset, "cursor at or past end_offset means entry was acknowledged");
     }
 

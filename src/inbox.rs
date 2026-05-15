@@ -131,6 +131,16 @@ pub fn acknowledge(
     new_offset: u64,
     in_flight_path: &Path,
 ) -> io::Result<()> {
+    // Defense-in-depth: never rewind the cursor. If new_offset is behind the
+    // current cursor (e.g., stale .in-flight was fed to acknowledge after a
+    // partial recover), skip the write rather than causing re-delivery of
+    // already-acknowledged entries.
+    let current = read_offset(offset_file).unwrap_or(0);
+    if new_offset < current {
+        // Cursor would rewind — skip advance, still remove .in-flight.
+        let _ = fs::remove_file(in_flight_path);
+        return Ok(());
+    }
     // Step 1: advance cursor (atomic).
     write_offset(offset_file, new_offset)?;
     // Step 2: remove `.in-flight` (non-atomic, but recoverable — see §2 of spec).
@@ -587,11 +597,11 @@ mod tests {
         let read_back = InFlightEntry::read_from(&in_flight).unwrap().unwrap();
         let current_offset = read_offset(&offset).unwrap();
 
-        // Stale: cursor (end_offset) > read_back.end_offset? No — equal.
-        // is_stale is `current_offset > self.end_offset`.
-        assert!(!read_back.is_stale(current_offset)); // equal is NOT stale — edge case
+        // cursor == end_offset: is_stale uses >= so this IS stale.
+        // The entry was acknowledged in step 1; .in-flight just wasn't cleaned up.
+        assert!(read_back.is_stale(current_offset));
 
-        // One byte past: definitely stale.
-        assert!(read_back.is_stale(current_offset + 1));
+        // Strictly before end_offset: not stale.
+        assert!(!read_back.is_stale(current_offset - 1));
     }
 }

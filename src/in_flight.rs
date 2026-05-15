@@ -93,10 +93,17 @@ impl InFlightEntry {
     }
 
     /// Returns `true` if this in-flight entry is stale — meaning the offset
-    /// cursor has already advanced past this entry in a prior acknowledgement
-    /// step (crash between cursor advance and `.in-flight` removal).
+    /// cursor has already reached or passed this entry's end in a prior
+    /// acknowledgement step (crash between cursor advance and `.in-flight`
+    /// removal).
+    ///
+    /// When `current_offset >= end_offset`, the entry is fully past the
+    /// cursor: it was acknowledged in step 1 but `.in-flight` removal was
+    /// interrupted. Safe to delete without applying orphan policy.
+    ///
+    /// Uses `>=` to match `recover`'s stale check (recover.rs).
     pub fn is_stale(&self, current_offset: u64) -> bool {
-        current_offset > self.end_offset
+        current_offset >= self.end_offset
     }
 }
 
@@ -209,11 +216,21 @@ mod tests {
     }
 
     #[test]
-    fn is_not_stale_when_cursor_at_or_before_end_offset() {
+    fn is_not_stale_when_cursor_before_end_offset() {
         let e = InFlightEntry::new("line", 10, 15);
-        assert!(!e.is_stale(15)); // cursor at end_offset = live (not yet acknowledged)
+        // cursor strictly before end_offset → live orphan
+        assert!(!e.is_stale(14));
         assert!(!e.is_stale(10)); // cursor at start = live
         assert!(!e.is_stale(0));  // cursor before start = live
+    }
+
+    #[test]
+    fn is_stale_when_cursor_at_end_offset() {
+        // cursor == end_offset: entry is past the cursor (byte position after
+        // the entry's last byte). Treat as stale — already acknowledged in
+        // step 1 of the ack sequence.
+        let e = InFlightEntry::new("line", 10, 15);
+        assert!(e.is_stale(15));
     }
 
     #[test]

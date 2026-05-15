@@ -107,29 +107,22 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
     // Live orphan: apply policy.
     match policy {
         OrphanPolicy::Retry => {
-            // Prepend orphan's raw_line to the inbox so it's the first entry
-            // in the next session. Write a fresh temporary inbox, then rename.
+            // The orphan is already in inbox.jsonl at entry.start_offset —
+            // recover always runs BEFORE the launcher truncates the inbox.
+            // There is nothing to prepend. The correct repair is:
+            //   1. Reset the cursor to entry.start_offset (walk it back to K).
+            //   2. Remove .in-flight (will be rewritten on next delivery tick).
             //
-            // Strategy: write orphan line + newline + existing inbox content
-            // to a .tmp file, then rename over the inbox. Reset offset to 0
-            // so the hook reads from the top.
-            let orphan_line = format!("{}\n", entry.raw_line);
-            let existing = match fs::read(inbox_path) {
-                Ok(b) => b,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
-                Err(e) => return Err(e),
-            };
-            let tmp = inbox_path.with_extension("tmp");
-            {
-                let mut f = fs::File::create(&tmp)?;
-                f.write_all(orphan_line.as_bytes())?;
-                f.write_all(&existing)?;
-                f.sync_all()?;
-            }
-            fs::rename(&tmp, inbox_path)?;
-            // Reset offset to 0 (entry is now at the top).
-            inbox::write_offset(&offset_file, 0)?;
-            // Remove .in-flight — it will be rewritten on next delivery.
+            // This means the next session reads K first, exactly as if K had
+            // never been delivered. No duplicate is created because we are not
+            // copying bytes — we are moving a cursor.
+            //
+            // Idempotency note: if the agent DID process K (crash scenario C3),
+            // the side effect fires twice. This is the documented contract for
+            // retry policy — the caller is responsible for idempotency at the
+            // agent layer. See spec §6 risk #5.
+            inbox::write_offset(&offset_file, entry.start_offset)?;
+            // Remove .in-flight — it will be rewritten on next delivery tick.
             fs::remove_file(&in_flight_path)?;
             Ok(RecoveryOutcome::ReQueued {
                 entry_id: entry.entry_id,
@@ -248,7 +241,10 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn retry_prepends_orphan_to_inbox_and_resets_offset() {
+    fn retry_resets_cursor_to_start_offset_no_duplicate() {
+        // BLOCKER regression: retry must NOT duplicate the entry.
+        // The orphan is already at its original offset; recover resets the
+        // cursor to start_offset rather than prepending a second copy.
         let dir = TempDir::new().unwrap();
         let inbox = make_inbox(&dir);
         let offset_file = dir.path().join(".inbox-offset");
@@ -257,6 +253,9 @@ mod tests {
         // Write two entries, deliver the first (leaving it as orphan).
         write_line(&inbox, "entry K");
         write_line(&inbox, "entry K+1");
+
+        // Snapshot inbox content before recovery.
+        let inbox_before = fs::read_to_string(&inbox).unwrap();
 
         // Simulate first delivery via hook::run.
         hook::run(&inbox, &hook::Mode::Drain).unwrap();
@@ -275,17 +274,52 @@ mod tests {
         // .in-flight should be gone.
         assert!(!in_flight_path.exists());
 
-        // Offset should be 0.
+        // Cursor reset to start_offset of entry K (which is 0).
         let cur = inbox::read_offset(&offset_file).unwrap();
-        assert_eq!(cur, 0);
+        assert_eq!(cur, 0, "cursor must be reset to start_offset of orphan");
 
-        // Inbox should now start with "entry K".
-        let contents = fs::read_to_string(&inbox).unwrap();
-        assert!(
-            contents.starts_with("entry K\n"),
-            "inbox must start with orphan after retry: {:?}",
-            contents
+        // CRITICAL: inbox contents must be identical to before recovery.
+        // No line was prepended; cursor was walked back instead.
+        let inbox_after = fs::read_to_string(&inbox).unwrap();
+        assert_eq!(
+            inbox_before, inbox_after,
+            "retry must not modify inbox contents — orphan is already in place"
         );
+
+        // Entry K appears exactly once in the inbox.
+        let count = inbox_after.lines().filter(|l| *l == "entry K").count();
+        assert_eq!(count, 1, "entry K must appear exactly once after retry");
+    }
+
+    #[test]
+    fn retry_on_poison_entry_does_not_grow_inbox_over_5_cycles() {
+        // BLOCKER regression: retry on a repeatedly-failing entry must not
+        // grow the inbox. Five cycles, inbox line count must stay constant.
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+        let in_flight_path = in_flight(&dir);
+
+        write_line(&inbox, "poison");
+        let initial_line_count = fs::read_to_string(&inbox).unwrap().lines().count();
+
+        for cycle in 1..=5 {
+            // Deliver (writes .in-flight, cursor stays at 0).
+            hook::run(&inbox, &hook::Mode::Drain).unwrap();
+            assert!(in_flight_path.exists(), "cycle {}: .in-flight must exist after delivery", cycle);
+
+            // Simulate: session fails without ack.
+            let _ = fs::remove_file(dir.path().join(".responded"));
+
+            // Recover with retry: must reset cursor, not prepend.
+            recover(&inbox, OrphanPolicy::Retry).unwrap();
+
+            let line_count = fs::read_to_string(&inbox).unwrap().lines().count();
+            assert_eq!(
+                line_count, initial_line_count,
+                "cycle {}: inbox must not grow — had {} lines, now {} lines",
+                cycle, initial_line_count, line_count
+            );
+        }
     }
 
     // -------------------------------------------------------------------------

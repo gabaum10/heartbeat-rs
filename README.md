@@ -200,15 +200,27 @@ heartbeat-stop recover --inbox "$INBOX" --on-orphan deadletter
 | Policy | Behavior | Use when |
 |--------|----------|----------|
 | `deadletter` (default) | Appends orphan to `.dead-letter.jsonl`, advances cursor | Duplicate side effects are unacceptable; operator reviews dead-letter |
-| `retry` | Prepends orphan back to inbox as first entry | Work is idempotent, or the agent never actually saw the entry |
-| `drop` | Deletes `.in-flight`, advances cursor | Upstream source (IMAP, ticket API) is the retry mechanism |
+| `retry` | Resets cursor to `start_offset` of orphan so next session re-delivers it | Work is idempotent, or the agent never actually saw the entry |
+| `drop` | Advances cursor past orphan, deletes `.in-flight` | Upstream source (IMAP, ticket API) is the retry mechanism |
+
+**Retry policy detail:** The orphan entry is already in `inbox.jsonl` at its original position — `recover` runs before the launcher truncates the inbox. The `retry` policy does NOT copy or prepend anything. It walks the cursor back to `start_offset` so the hook re-delivers the same bytes on the next session start. This means N crash-and-retry cycles leave the inbox unchanged in size; the same entry is re-offered each time. If the agent's work is not idempotent, use `deadletter` instead.
+
+**`drop` caveat:** the orphan's `raw_line` is not preserved anywhere. If there is no upstream retry source, the entry is lost. Only use `drop` when an external system (IMAP, ticket queue) will re-surface the work on the next poll.
 
 ### Stale vs. Live Orphans
 
 `recover` distinguishes two cases automatically:
 
-- **Live orphan** — cursor is at `start_offset` (entry was never acknowledged). Apply the configured policy.
-- **Stale orphan** — cursor has already advanced past `end_offset` (entry was acknowledged in a prior step, but `.in-flight` removal was interrupted). Silently delete `.in-flight`. No policy needed.
+- **Live orphan** — cursor is at or before `start_offset` (entry was never acknowledged). Apply the configured policy.
+- **Stale orphan** — cursor has reached or passed `end_offset` (`current_offset >= end_offset`). The entry was acknowledged in step 1 of the ack sequence but `.in-flight` removal was interrupted. Silently delete `.in-flight`. No policy action needed — the entry was already processed.
+
+### Concurrency contract
+
+**`recover` must not run concurrently with itself or with a live hook session.**
+
+Running two `recover` invocations in parallel on the same inbox dir is unsafe: both read `.in-flight`, both attempt to apply policy, one will hit a "file not found" error on `.in-flight` removal and exit non-zero, and `deadletter` entries will be duplicated. The launcher's PID-file lock (`$AGENT_DIR/.wrapper.pid`) prevents the realistic case where a launcher cycle overlaps with a running session. Do not invoke `recover` manually while a session is active.
+
+If your policy is `retry` or `deadletter`, do NOT use `|| true` to swallow recover's exit code — a recover failure (e.g., corrupt `.in-flight`) should halt the cycle so the orphan is not silently discarded. For `drop` policy (where loss is acceptable), `|| true` is safe.
 
 ## On-Disk Artifacts
 
