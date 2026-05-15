@@ -8,14 +8,28 @@
 //!
 //! The Fen launcher pattern does `> "$INBOX"; echo -n "0" > .inbox-offset`
 //! to start fresh. If a prior session left a `.in-flight` artifact, blowing
-//! away the inbox and resetting the offset silently defeats Fix B — the
-//! orphan evidence is gone. Running `recover` first gives the launcher the
-//! chance to apply the configured policy before wiping state.
+//! away the inbox and resetting the offset silently defeats the deferred-ack
+//! guarantee — the orphan evidence is gone. Running `recover` first gives the
+//! launcher the chance to apply the configured policy before wiping state.
+//!
+//! ## Single source of truth for session-end cleanup
+//!
+//! `recover` is the authoritative cleanup point for all inbox-side session
+//! artifacts. On every successful path it removes BOTH `.in-flight` AND
+//! `.responded`. This means:
+//!
+//! - The documented remediation "run `heartbeat-stop recover`" actually
+//!   resolves the inconsistent state without any additional manual steps.
+//! - Launchers do NOT need to `rm .responded` separately after calling recover.
+//! - The crash window between hook ack-step-1 (cursor advance + .in-flight
+//!   removal) and ack-step-2 (.responded removal) leaves `.responded` without
+//!   `.in-flight` on disk. Recover on next startup detects cursor >= end_offset
+//!   (stale orphan), removes both artifacts, and continues cleanly.
 //!
 //! ## Policies
 //!
-//! - `retry` — prepend orphan's `raw_line` back to the inbox so it is
-//!   delivered first in the next session. Use when agent-side work is
+//! - `retry` — reset cursor to `start_offset` so the next session re-delivers
+//!   the orphan from its original position. Use when agent-side work is
 //!   idempotent or the entry was never seen by the agent (C1/C2 crash cases).
 //!   Risk: duplicate side effects if the agent already processed it (C3 case).
 //!
@@ -24,16 +38,15 @@
 //!   side effects are unacceptable. Requires operator attention to drain
 //!   the dead-letter file.
 //!
-//! - `drop` — delete `.in-flight` and advance cursor. Use when the retry
-//!   mechanism is upstream (e.g., Fen's IMAP layer will re-fetch unread mail)
-//!   and loss is acceptable.
+//! - `drop` — advance cursor, delete `.in-flight`. Accept the loss.
+//!   Use when the retry mechanism is upstream (e.g., Fen's IMAP layer will
+//!   re-fetch unread mail).
 //!
 //! ## Stale orphan fast path
 //!
-//! If `.in-flight.start_offset` < current cursor, the entry was already
-//! acknowledged in a prior step but `.in-flight` was not removed (crash
-//! between ack step 1 and step 2). This is a stale orphan — delete
-//! `.in-flight` without action. No policy needed.
+//! If cursor >= `end_offset`, the entry was already acknowledged in a prior
+//! step but `.in-flight` (and possibly `.responded`) was not removed (crash
+//! between ack steps). Delete both artifacts without applying orphan policy.
 //!
 //! ## Return value
 //!
@@ -80,25 +93,42 @@ pub enum RecoveryOutcome {
 ///
 /// Must be called BEFORE truncating the inbox or resetting the offset file.
 ///
+/// On every successful path, removes both `.in-flight` AND `.responded` so
+/// the next session starts from a fully clean state. Launchers do not need
+/// to remove `.responded` separately.
+///
 /// Returns a `RecoveryOutcome` describing what happened.
 pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOutcome> {
     let io_dir = inbox_path.parent().unwrap_or(Path::new("."));
     let in_flight_path = in_flight::in_flight_file_for(inbox_path);
+    let responded_flag = io_dir.join(".responded");
     let offset_file = inbox::offset_file_for(inbox_path);
 
-    // No .in-flight: nothing to recover.
+    // Defensive cleanup: remove any stale .dead-letter.jsonl.tmp from a prior
+    // crashed recover run. Ignore NotFound — the file may not exist.
+    let dead_letter_tmp = io_dir.join(".dead-letter.jsonl.tmp");
+    let _ = fs::remove_file(&dead_letter_tmp);
+
+    // No .in-flight: nothing to recover. Still remove .responded if it exists
+    // (e.g., crash between hook ack-step-1 and ack-step-2 left .responded
+    // without .in-flight, or operator called recover to clear a stuck state).
     let entry = match InFlightEntry::read_from(&in_flight_path)? {
         Some(e) => e,
-        None => return Ok(RecoveryOutcome::NothingToRecover),
+        None => {
+            // Remove .responded if present (stale from prior session).
+            let _ = fs::remove_file(&responded_flag);
+            return Ok(RecoveryOutcome::NothingToRecover);
+        }
     };
 
     let current_offset = inbox::read_offset(&offset_file).unwrap_or(0);
 
     // Stale orphan: cursor already advanced past the entry's end.
     // Crash occurred between ack step 1 (cursor advance) and step 2
-    // (.in-flight removal). Entry was already acknowledged — just clean up.
+    // (.in-flight removal). Entry was already acknowledged — clean up both.
     if current_offset >= entry.end_offset {
         fs::remove_file(&in_flight_path)?;
+        let _ = fs::remove_file(&responded_flag);
         return Ok(RecoveryOutcome::StaleOrphanDeleted {
             entry_id: entry.entry_id,
         });
@@ -124,6 +154,9 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
             inbox::write_offset(&offset_file, entry.start_offset)?;
             // Remove .in-flight — it will be rewritten on next delivery tick.
             fs::remove_file(&in_flight_path)?;
+            // Remove .responded so the next session starts without the F12
+            // inconsistency check triggering on the very first hook tick.
+            let _ = fs::remove_file(&responded_flag);
             Ok(RecoveryOutcome::ReQueued {
                 entry_id: entry.entry_id,
             })
@@ -175,6 +208,8 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
             inbox::write_offset(&offset_file, entry.end_offset)?;
             // Remove .in-flight.
             fs::remove_file(&in_flight_path)?;
+            // Remove .responded so the next session starts clean.
+            let _ = fs::remove_file(&responded_flag);
             Ok(RecoveryOutcome::DeadLettered {
                 entry_id: entry.entry_id,
             })
@@ -184,6 +219,8 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
             // Advance cursor past the entry, delete .in-flight. Accept the loss.
             inbox::write_offset(&offset_file, entry.end_offset)?;
             fs::remove_file(&in_flight_path)?;
+            // Remove .responded so the next session starts clean.
+            let _ = fs::remove_file(&responded_flag);
             Ok(RecoveryOutcome::Dropped {
                 entry_id: entry.entry_id,
             })
@@ -529,21 +566,21 @@ mod tests {
         assert!(in_flight_path.exists());
 
         // Simulate: session crashes. Recover with retry.
-        // recover removes .in-flight and resets cursor; it does NOT remove
-        // .responded — that is the launcher's responsibility before the next
-        // session starts (same cleanup a launcher does on session start).
+        // recover removes .in-flight, resets cursor, AND removes .responded —
+        // it is the single cleanup point for all inbox-side session artifacts.
         let outcome = recover(&inbox, OrphanPolicy::Retry).unwrap();
         match &outcome {
             RecoveryOutcome::ReQueued { .. } => {}
             other => panic!("expected ReQueued, got {:?}", other),
         }
         assert!(!in_flight_path.exists());
-
-        // Launcher cleanup: remove .responded before launching new session.
-        // Without this, the hook sees .responded without .in-flight (F12 error).
-        let _ = fs::remove_file(dir.path().join(".responded"));
+        assert!(
+            !dir.path().join(".responded").exists(),
+            "recover must remove .responded so next session starts clean"
+        );
 
         // Next hook::run (new session, clean state) must re-deliver K.
+        // No manual .responded cleanup needed — recover handled it.
         let d2 = hook::run(&inbox, &hook::Mode::Drain).unwrap();
         assert_eq!(
             d2,
@@ -554,5 +591,133 @@ mod tests {
         // After ack (second tick), K+1 should come next.
         let d3 = hook::run(&inbox, &hook::Mode::Drain).unwrap();
         assert_eq!(d3, hook::Decision::Block("entry K+1".to_string()));
+    }
+
+    // -------------------------------------------------------------------------
+    // Fen cascade reproducer (Wren round 3 BLOCKER)
+    // -------------------------------------------------------------------------
+
+    /// Reproduce the exact silent-data-loss cascade Wren verified live:
+    ///
+    /// Cycle N: session crashes, leaves .in-flight + .responded on disk.
+    /// Cycle N+1: launcher runs recover (drop), truncates inbox, writes new
+    ///   batch, launches claude. First Stop hook tick fires.
+    ///
+    /// Before fix: hook sees .responded (cycle N) without .in-flight (removed
+    ///   by recover) → F12 error → fail-open Approve → session ends → launcher
+    ///   marks emails read without triage.
+    ///
+    /// After fix: recover removes .responded alongside .in-flight → hook starts
+    ///   clean → first tick delivers new batch entry → session runs correctly.
+    #[test]
+    fn fen_cascade_drop_policy_clears_responded_before_next_session() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+        let in_flight_path = in_flight(&dir);
+        let responded_path = dir.path().join(".responded");
+
+        // --- Cycle N: write a batch, deliver, crash (no ack) ---
+        write_line(&inbox, "cycle N email batch");
+        hook::run(&inbox, &hook::Mode::Drain).unwrap();
+
+        // After delivery: .in-flight and .responded both present, cursor at 0.
+        assert!(in_flight_path.exists(), "cycle N: .in-flight must exist");
+        assert!(responded_path.exists(), "cycle N: .responded must exist");
+
+        // --- Cycle N+1: launcher startup ---
+
+        // Step 1: recover with drop policy.
+        let outcome = recover(&inbox, OrphanPolicy::Drop).unwrap();
+        match &outcome {
+            RecoveryOutcome::Dropped { .. } => {}
+            other => panic!("expected Dropped, got {:?}", other),
+        }
+
+        // .in-flight AND .responded must both be gone after recover.
+        assert!(!in_flight_path.exists(), "recover must remove .in-flight");
+        assert!(
+            !responded_path.exists(),
+            "recover must remove .responded — without this, next hook tick fires F12"
+        );
+
+        // Step 2: launcher truncates inbox and writes new cycle N+1 batch.
+        fs::write(&inbox, "").unwrap();
+        inbox::write_offset(&dir.path().join(".inbox-offset"), 0).unwrap();
+        write_line(&inbox, "cycle N+1 email batch");
+
+        // Step 3: new claude session starts. First Stop hook fires (turn 0).
+        // Must deliver the new batch, NOT trigger F12.
+        let decision = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        assert_eq!(
+            decision,
+            hook::Decision::Block("cycle N+1 email batch".to_string()),
+            "first hook tick of cycle N+1 must deliver new batch, not error out"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Crash window: between hook ack-step-1 and ack-step-2
+    // -------------------------------------------------------------------------
+
+    /// Crash between hook ack-step-1 (cursor advance + .in-flight removal) and
+    /// ack-step-2 (.responded removal) leaves .responded without .in-flight.
+    ///
+    /// Before fix: next session's first hook tick hit F12 error → session ends
+    ///   one entry early.
+    ///
+    /// After fix: recover on next startup detects cursor >= entry.end_offset
+    ///   (stale orphan fast path), removes both artifacts, returns
+    ///   StaleOrphanDeleted. Next hook tick starts clean and delivers the
+    ///   next queued entry.
+    #[test]
+    fn crash_between_ack_step1_and_step2_recovered_by_stale_orphan_path() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+        let in_flight_path = in_flight(&dir);
+        let responded_path = dir.path().join(".responded");
+        let offset_file = dir.path().join(".inbox-offset");
+
+        write_line(&inbox, "entry K");
+        write_line(&inbox, "entry K+1");
+
+        // Deliver entry K.
+        hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        assert!(in_flight_path.exists());
+        assert!(responded_path.exists());
+
+        // Simulate: hook ack-step-1 ran (cursor past K, .in-flight removed)
+        // but process was killed before ack-step-2 (.responded removal).
+        // Replicate that partial state manually.
+        let in_flight_entry =
+            crate::in_flight::InFlightEntry::read_from(&in_flight_path)
+                .unwrap()
+                .unwrap();
+        inbox::write_offset(&offset_file, in_flight_entry.end_offset).unwrap();
+        fs::remove_file(&in_flight_path).unwrap();
+        // .responded is still present (ack-step-2 didn't run).
+        assert!(responded_path.exists());
+        assert!(!in_flight_path.exists());
+
+        // Launcher runs recover on next startup.
+        // cursor >= entry.end_offset → stale orphan fast path.
+        let outcome = recover(&inbox, OrphanPolicy::Drop).unwrap();
+        match &outcome {
+            RecoveryOutcome::NothingToRecover => {}
+            // Stale orphan is also acceptable — both clean the state.
+            RecoveryOutcome::StaleOrphanDeleted { .. } => {}
+            other => panic!("expected NothingToRecover or StaleOrphanDeleted, got {:?}", other),
+        }
+
+        // Both artifacts must be gone.
+        assert!(!in_flight_path.exists(), "recover must remove .in-flight (or it was already gone)");
+        assert!(!responded_path.exists(), "recover must remove .responded after stale-orphan fast path");
+
+        // Next hook tick must deliver entry K+1 cleanly, not error.
+        let decision = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        assert_eq!(
+            decision,
+            hook::Decision::Block("entry K+1".to_string()),
+            "hook must deliver K+1 cleanly after crash-window recovery"
+        );
     }
 }

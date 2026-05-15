@@ -162,16 +162,12 @@ fn recover_retry_then_hook_redelivers_entry_k() {
     let rec = run_recover(&inbox, "retry");
     assert_eq!(rec.status.code(), Some(0), "recover must exit 0 on success");
 
-    // .in-flight removed, .responded still present (recover doesn't touch it).
-    assert!(!dir.path().join(".in-flight").exists());
-
-    // New session: hook runs with .responded still from crash. This is the
-    // inconsistent state (F12) — .responded without .in-flight → error exit.
-    // The launcher must clean up .responded before launching the next session.
-    // Simulate the launcher cleanup:
-    let _ = fs::remove_file(dir.path().join(".responded"));
+    // recover removes both .in-flight AND .responded — single cleanup point.
+    assert!(!dir.path().join(".in-flight").exists(), ".in-flight must be removed by recover");
+    assert!(!dir.path().join(".responded").exists(), ".responded must be removed by recover");
 
     // Now hook runs cleanly: no .responded, cursor at 0, K is first entry.
+    // No manual .responded cleanup needed.
     let d2 = run_hook(&inbox, "drain");
     assert_eq!(d2.status.code(), Some(0));
     let stdout2 = String::from_utf8_lossy(&d2.stdout);

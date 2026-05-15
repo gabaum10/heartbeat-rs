@@ -219,15 +219,13 @@ heartbeat-stop recover --inbox "$INBOX" --on-orphan retry
 echo "$NEW_WORK" >> "$INBOX"
 ```
 
-**Launcher cleanup after crash recovery:** `recover` removes `.in-flight` and adjusts the cursor, but does NOT remove `.responded`. If `.responded` is still present when the next session starts, the hook will see `.responded` without `.in-flight` and return an error directing the operator to run `recover`. Launchers must remove `.responded` before starting a new session after any crash recovery:
+**`recover` is the single cleanup point for all inbox-side session artifacts.** On every successful path it removes both `.in-flight` AND `.responded`. Launchers do not need to remove `.responded` separately — calling `recover` before the next session is sufficient:
 
 ```bash
 heartbeat-stop recover --inbox "$INBOX" --on-orphan retry
-rm -f "$AGENT_DIR/.responded"   # clean session start
+# No rm .responded needed — recover handles it.
 cd "$WORKSPACE" && claude ...
 ```
-
-Launchers that use `drop` or `deadletter` and then truncate the inbox (`> "$INBOX"`) handle this implicitly — a fresh inbox with a reset cursor makes `.responded` stale. Only launchers using `retry` (which preserve the inbox) need to remove `.responded` explicitly.
 
 **`drop` caveat:** the orphan's `raw_line` is not preserved anywhere. If there is no upstream retry source, the entry is lost. Only use `drop` when an external system (IMAP, ticket queue) will re-surface the work on the next poll.
 

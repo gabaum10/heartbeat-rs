@@ -92,14 +92,17 @@ pub fn run(inbox_path: &Path, mode: &Mode) -> io::Result<Decision> {
                 // Silently proceeding would re-deliver the entry at the current
                 // cursor position, which the agent already processed.
                 //
-                // Return an error instead so the failure is visible. The hook's
-                // fail-open handler in main.rs will emit this to stderr and
-                // approve the stop. Operator should run `heartbeat-stop recover`
-                // to clean up before launching a new session.
+                // Return an error so the failure is visible in stderr. The
+                // hook's fail-open handler in main.rs emits this and approves
+                // the stop. The operator (or launcher startup script) should
+                // run `heartbeat-stop recover` before launching a new session —
+                // recover removes both .in-flight and .responded, fully
+                // clearing this inconsistent state.
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "inconsistent state: .responded present without .in-flight; \
-                     run `heartbeat-stop recover --inbox <path>` to resolve",
+                     run `heartbeat-stop recover --inbox <path> --on-orphan <policy>` \
+                     to clear both artifacts before the next session",
                 ));
             }
         };
