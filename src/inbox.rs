@@ -134,11 +134,7 @@ pub fn read_next_entry(inbox: &Path, offset_file: &Path) -> io::Result<Option<In
 /// `offset_file` — path to the `.inbox-offset` cursor file.
 /// `new_offset` — the `end_offset` from the `InboxEntry` being acknowledged.
 /// `in_flight_path` — path to the `.in-flight` artifact to remove.
-pub fn acknowledge(
-    offset_file: &Path,
-    new_offset: u64,
-    in_flight_path: &Path,
-) -> io::Result<()> {
+pub fn acknowledge(offset_file: &Path, new_offset: u64, in_flight_path: &Path) -> io::Result<()> {
     // Defense-in-depth: never rewind the cursor. If new_offset is behind the
     // current cursor (e.g., stale .in-flight was fed to acknowledge after a
     // partial recover), skip the write rather than causing re-delivery of
@@ -502,7 +498,10 @@ mod tests {
         let e1 = read_next_entry(&inbox, &offset).unwrap().unwrap();
         // Content is lossy-decoded but the byte offsets are what matter here.
         assert_eq!(e1.start_offset, 0);
-        assert_eq!(e1.end_offset, 7, "consumed must be 7 bytes (6 content + 1 newline)");
+        assert_eq!(
+            e1.end_offset, 7,
+            "consumed must be 7 bytes (6 content + 1 newline)"
+        );
 
         ack(&dir, &e1);
 
@@ -534,8 +533,16 @@ mod tests {
         let e1 = read_next_entry(&inbox, &offset).unwrap().unwrap();
         assert_eq!(e1.start_offset, 0);
         assert_eq!(e1.end_offset, 9, "consumed must be 9 bytes (entire buffer)");
-        assert!(e1.decoded.contains("bad"), "content prefix preserved: {}", e1.decoded);
-        assert!(e1.decoded.contains("bytes"), "content suffix preserved: {}", e1.decoded);
+        assert!(
+            e1.decoded.contains("bad"),
+            "content prefix preserved: {}",
+            e1.decoded
+        );
+        assert!(
+            e1.decoded.contains("bytes"),
+            "content suffix preserved: {}",
+            e1.decoded
+        );
 
         ack(&dir, &e1);
         assert_eq!(read_next_entry(&inbox, &offset).unwrap(), None);
@@ -581,11 +588,7 @@ mod tests {
         let entry = read_next_entry(&inbox, &offset).unwrap().unwrap();
         // Simulate: hook wrote .in-flight, then crashed (no ack, no responded).
         use crate::in_flight::InFlightEntry;
-        let inflight = InFlightEntry::new(
-            &entry.raw_line,
-            entry.start_offset,
-            entry.end_offset,
-        );
+        let inflight = InFlightEntry::new(&entry.raw_line, entry.start_offset, entry.end_offset);
         inflight.write_to(&in_flight).unwrap();
 
         // Offset is still at 0 (start of K) — not advanced.
@@ -617,11 +620,7 @@ mod tests {
         let entry = read_next_entry(&inbox, &offset).unwrap().unwrap();
 
         use crate::in_flight::InFlightEntry;
-        let inflight = InFlightEntry::new(
-            &entry.raw_line,
-            entry.start_offset,
-            entry.end_offset,
-        );
+        let inflight = InFlightEntry::new(&entry.raw_line, entry.start_offset, entry.end_offset);
         inflight.write_to(&in_flight).unwrap();
 
         // Agent responded, but hook crashed before ack. Cursor still at 0.
@@ -653,11 +652,7 @@ mod tests {
         let entry = read_next_entry(&inbox, &offset).unwrap().unwrap();
 
         use crate::in_flight::InFlightEntry;
-        let inflight = InFlightEntry::new(
-            &entry.raw_line,
-            entry.start_offset,
-            entry.end_offset,
-        );
+        let inflight = InFlightEntry::new(&entry.raw_line, entry.start_offset, entry.end_offset);
         inflight.write_to(&in_flight).unwrap();
 
         // Step 1 of ack succeeded: cursor advanced past K.

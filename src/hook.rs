@@ -117,11 +117,8 @@ pub fn run(inbox_path: &Path, mode: &Mode) -> io::Result<Decision> {
         match inbox::read_next_entry(inbox_path, &offset_file)? {
             Some(next) => {
                 // Deliver next: write .in-flight, touch .responded, emit Block.
-                let new_in_flight = InFlightEntry::new(
-                    &next.raw_line,
-                    next.start_offset,
-                    next.end_offset,
-                );
+                let new_in_flight =
+                    InFlightEntry::new(&next.raw_line, next.start_offset, next.end_offset);
                 new_in_flight.write_to(&in_flight_path)?;
                 touch(&responded_flag)?;
                 return Ok(Decision::Block(next.decoded));
@@ -139,11 +136,8 @@ pub fn run(inbox_path: &Path, mode: &Mode) -> io::Result<Decision> {
         Some(entry) => {
             // Deliver: write .in-flight first (for crash recoverability),
             // then touch .responded, then emit Block.
-            let new_in_flight = InFlightEntry::new(
-                &entry.raw_line,
-                entry.start_offset,
-                entry.end_offset,
-            );
+            let new_in_flight =
+                InFlightEntry::new(&entry.raw_line, entry.start_offset, entry.end_offset);
             new_in_flight.write_to(&in_flight_path)?;
             touch(&responded_flag)?;
             Ok(Decision::Block(entry.decoded))
@@ -457,8 +451,14 @@ mod tests {
 
         // cursor == end_offset: entry is fully past the cursor.
         // is_stale uses >= so this is correctly detected as stale.
-        assert!(inf.is_stale(cur), "cursor at end_offset must be detected as stale");
-        assert!(cur >= inf.end_offset, "cursor at or past end_offset means entry was acknowledged");
+        assert!(
+            inf.is_stale(cur),
+            "cursor at end_offset must be detected as stale"
+        );
+        assert!(
+            cur >= inf.end_offset,
+            "cursor at or past end_offset means entry was acknowledged"
+        );
     }
 
     // -------------------------------------------------------------------------

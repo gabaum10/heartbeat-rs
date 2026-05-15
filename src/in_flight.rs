@@ -221,7 +221,7 @@ mod tests {
         // cursor strictly before end_offset → live orphan
         assert!(!e.is_stale(14));
         assert!(!e.is_stale(10)); // cursor at start = live
-        assert!(!e.is_stale(0));  // cursor before start = live
+        assert!(!e.is_stale(0)); // cursor before start = live
     }
 
     #[test]
@@ -262,6 +262,9 @@ mod tests {
         entry.write_to(&path).unwrap();
 
         assert!(path.exists(), ".in-flight must exist after write");
-        assert!(!tmp.exists(), ".in-flight.tmp must be cleaned up after rename");
+        assert!(
+            !tmp.exists(),
+            ".in-flight.tmp must be cleaned up after rename"
+        );
     }
 }

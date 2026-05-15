@@ -368,7 +368,11 @@ mod tests {
         for cycle in 1..=5 {
             // Deliver (writes .in-flight, cursor stays at 0).
             hook::run(&inbox, &hook::Mode::Drain).unwrap();
-            assert!(in_flight_path.exists(), "cycle {}: .in-flight must exist after delivery", cycle);
+            assert!(
+                in_flight_path.exists(),
+                "cycle {}: .in-flight must exist after delivery",
+                cycle
+            );
 
             // Simulate: session fails without ack.
             let _ = fs::remove_file(dir.path().join(".responded"));
@@ -688,10 +692,9 @@ mod tests {
         // Simulate: hook ack-step-1 ran (cursor past K, .in-flight removed)
         // but process was killed before ack-step-2 (.responded removal).
         // Replicate that partial state manually.
-        let in_flight_entry =
-            crate::in_flight::InFlightEntry::read_from(&in_flight_path)
-                .unwrap()
-                .unwrap();
+        let in_flight_entry = crate::in_flight::InFlightEntry::read_from(&in_flight_path)
+            .unwrap()
+            .unwrap();
         inbox::write_offset(&offset_file, in_flight_entry.end_offset).unwrap();
         fs::remove_file(&in_flight_path).unwrap();
         // .responded is still present (ack-step-2 didn't run).
@@ -705,12 +708,21 @@ mod tests {
             RecoveryOutcome::NothingToRecover => {}
             // Stale orphan is also acceptable — both clean the state.
             RecoveryOutcome::StaleOrphanDeleted { .. } => {}
-            other => panic!("expected NothingToRecover or StaleOrphanDeleted, got {:?}", other),
+            other => panic!(
+                "expected NothingToRecover or StaleOrphanDeleted, got {:?}",
+                other
+            ),
         }
 
         // Both artifacts must be gone.
-        assert!(!in_flight_path.exists(), "recover must remove .in-flight (or it was already gone)");
-        assert!(!responded_path.exists(), "recover must remove .responded after stale-orphan fast path");
+        assert!(
+            !in_flight_path.exists(),
+            "recover must remove .in-flight (or it was already gone)"
+        );
+        assert!(
+            !responded_path.exists(),
+            "recover must remove .responded after stale-orphan fast path"
+        );
 
         // Next hook tick must deliver entry K+1 cleanly, not error.
         let decision = hook::run(&inbox, &hook::Mode::Drain).unwrap();

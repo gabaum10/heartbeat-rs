@@ -77,15 +77,24 @@ fn happy_path_deliver_ack_exit_codes_and_stdout() {
     let out1 = run_hook(&inbox, "drain");
     assert_eq!(out1.status.code(), Some(0), "hook must exit 0");
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
-    assert!(!stdout1.is_empty(), "deliver tick must produce non-empty stdout");
-    let parsed: serde_json::Value = serde_json::from_str(&stdout1)
-        .expect("deliver tick stdout must be valid JSON");
+    assert!(
+        !stdout1.is_empty(),
+        "deliver tick must produce non-empty stdout"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout1).expect("deliver tick stdout must be valid JSON");
     assert_eq!(parsed["decision"], "block");
     assert_eq!(parsed["reason"], "triage please");
 
     // .responded must exist; .in-flight must exist.
-    assert!(dir.path().join(".responded").exists(), ".responded must be written");
-    assert!(dir.path().join(".in-flight").exists(), ".in-flight must be written");
+    assert!(
+        dir.path().join(".responded").exists(),
+        ".responded must be written"
+    );
+    assert!(
+        dir.path().join(".in-flight").exists(),
+        ".in-flight must be written"
+    );
 
     // Cursor must NOT have advanced on delivery (Fix B).
     // If the offset file doesn't exist, cursor is implicitly 0 — also correct.
@@ -104,8 +113,14 @@ fn happy_path_deliver_ack_exit_codes_and_stdout() {
     assert!(stdout2.is_empty(), "approve tick must produce empty stdout");
 
     // .responded and .in-flight must be gone.
-    assert!(!dir.path().join(".responded").exists(), ".responded must be removed after ack");
-    assert!(!dir.path().join(".in-flight").exists(), ".in-flight must be removed after ack");
+    assert!(
+        !dir.path().join(".responded").exists(),
+        ".responded must be removed after ack"
+    );
+    assert!(
+        !dir.path().join(".in-flight").exists(),
+        ".in-flight must be removed after ack"
+    );
 
     // Cursor must have advanced past the entry.
     let cursor_after: u64 = fs::read_to_string(&offset_path)
@@ -163,8 +178,14 @@ fn recover_retry_then_hook_redelivers_entry_k() {
     assert_eq!(rec.status.code(), Some(0), "recover must exit 0 on success");
 
     // recover removes both .in-flight AND .responded — single cleanup point.
-    assert!(!dir.path().join(".in-flight").exists(), ".in-flight must be removed by recover");
-    assert!(!dir.path().join(".responded").exists(), ".responded must be removed by recover");
+    assert!(
+        !dir.path().join(".in-flight").exists(),
+        ".in-flight must be removed by recover"
+    );
+    assert!(
+        !dir.path().join(".responded").exists(),
+        ".responded must be removed by recover"
+    );
 
     // Now hook runs cleanly: no .responded, cursor at 0, K is first entry.
     // No manual .responded cleanup needed.
@@ -190,5 +211,9 @@ fn missing_inbox_flag_exits_nonzero() {
         .output()
         .expect("failed to run heartbeat-stop");
     // clap will exit non-zero when a required arg is missing.
-    assert_ne!(out.status.code(), Some(0), "missing --inbox must exit non-zero");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "missing --inbox must exit non-zero"
+    );
 }
