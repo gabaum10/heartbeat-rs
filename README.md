@@ -205,6 +205,20 @@ heartbeat-stop recover --inbox "$INBOX" --on-orphan deadletter
 
 **Retry policy detail:** The orphan entry is already in `inbox.jsonl` at its original position — `recover` runs before the launcher truncates the inbox. The `retry` policy does NOT copy or prepend anything. It walks the cursor back to `start_offset` so the hook re-delivers the same bytes on the next session start. This means N crash-and-retry cycles leave the inbox unchanged in size; the same entry is re-offered each time. If the agent's work is not idempotent, use `deadletter` instead.
 
+**WARNING — launchers using `retry` policy MUST preserve `inbox.jsonl` across cycles. Do NOT truncate the inbox after `recover`.** The retry semantic depends on the orphan bytes remaining at `start_offset`. Truncating erases them silently and permanently — there is no upstream source to recover from (that is why `retry` was chosen over `drop`). The truncate-and-reset pattern shown in the Fen example launcher below only works with `drop` and `deadletter` policies.
+
+```bash
+# BROKEN — silently loses the orphan that retry just preserved
+heartbeat-stop recover --inbox "$INBOX" --on-orphan retry
+> "$INBOX"                          # orphan bytes erased here
+echo -n "0" > "$AGENT_DIR/.inbox-offset"
+
+# CORRECT — write new work into the existing inbox; retry re-delivers orphan first
+heartbeat-stop recover --inbox "$INBOX" --on-orphan retry
+# Do NOT truncate. Append new entries after the existing content if needed.
+echo "$NEW_WORK" >> "$INBOX"
+```
+
 **`drop` caveat:** the orphan's `raw_line` is not preserved anywhere. If there is no upstream retry source, the entry is lost. Only use `drop` when an external system (IMAP, ticket queue) will re-surface the work on the next poll.
 
 ### Stale vs. Live Orphans
