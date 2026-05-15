@@ -22,7 +22,7 @@ Claude Code's `.claude/settings.json` supports a `Stop` hook. The hook's stdout 
 
 `heartbeat-stop` implements a state machine around this protocol. It reads from a JSONL inbox file at a byte offset. A `.responded` flag file bridges turns, and a `.in-flight` artifact bridges sessions.
 
-**Fix B (current):** The offset cursor is deferred -- it advances only when the agent acknowledges an entry (on the next hook tick), not when the entry is first read. This eliminates the silent-drop window where a launcher or agent crash between delivery and acknowledgement would lose the entry. A `.in-flight` file records the entry in transit so crash recovery can distinguish stale orphans from live ones.
+**Deferred-acknowledgement design:** The offset cursor advances only when the agent acknowledges an entry (on the next hook tick after a response), not when the entry is first read. This eliminates the silent-drop window where a launcher or agent crash between delivery and acknowledgement would lose the entry. A `.in-flight` file records the entry in transit so crash recovery can distinguish stale orphans from live ones.
 
 ## Installation
 
@@ -218,6 +218,16 @@ heartbeat-stop recover --inbox "$INBOX" --on-orphan retry
 # Do NOT truncate. Append new entries after the existing content if needed.
 echo "$NEW_WORK" >> "$INBOX"
 ```
+
+**Launcher cleanup after crash recovery:** `recover` removes `.in-flight` and adjusts the cursor, but does NOT remove `.responded`. If `.responded` is still present when the next session starts, the hook will see `.responded` without `.in-flight` and return an error directing the operator to run `recover`. Launchers must remove `.responded` before starting a new session after any crash recovery:
+
+```bash
+heartbeat-stop recover --inbox "$INBOX" --on-orphan retry
+rm -f "$AGENT_DIR/.responded"   # clean session start
+cd "$WORKSPACE" && claude ...
+```
+
+Launchers that use `drop` or `deadletter` and then truncate the inbox (`> "$INBOX"`) handle this implicitly — a fresh inbox with a reset cursor makes `.responded` stale. Only launchers using `retry` (which preserve the inbox) need to remove `.responded` explicitly.
 
 **`drop` caveat:** the orphan's `raw_line` is not preserved anywhere. If there is no upstream retry source, the entry is lost. Only use `drop` when an external system (IMAP, ticket queue) will re-surface the work on the next poll.
 

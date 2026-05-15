@@ -131,7 +131,21 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
 
         OrphanPolicy::DeadLetter => {
             // Append orphan to .dead-letter.jsonl in the inbox dir.
+            //
+            // Atomicity: a crash between the dead-letter write and the cursor
+            // advance leaves .in-flight present and cursor unmoved. Next recover
+            // call re-enters this branch and appends a duplicate record with the
+            // same entry_id. This is bounded and detectable — consumers should
+            // deduplicate on entry_id. We mitigate it by writing dead-letter
+            // contents to a .tmp file first, syncing, then atomically renaming
+            // into place before advancing the cursor.
+            //
+            // Strategy: read existing dead-letter, append new record, write full
+            // contents to .tmp, sync, rename. This is O(file) on every call but
+            // dead-letter is low-frequency and bounded by inbox throughput.
             let dead_letter_path = io_dir.join(".dead-letter.jsonl");
+            let dead_letter_tmp = io_dir.join(".dead-letter.jsonl.tmp");
+
             let record = serde_json::json!({
                 "entry_id": entry.entry_id,
                 "start_offset": entry.start_offset,
@@ -139,12 +153,24 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
                 "raw_line": entry.raw_line,
                 "delivered_at": entry.delivered_at,
             });
-            let mut f = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&dead_letter_path)?;
-            writeln!(f, "{}", record)?;
-            f.sync_all()?;
+            let new_line = format!("{}\n", record);
+
+            // Read existing contents (may not exist yet).
+            let existing = match fs::read(&dead_letter_path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
+                Err(e) => return Err(e),
+            };
+
+            // Write existing + new record to .tmp, then rename atomically.
+            {
+                let mut f = fs::File::create(&dead_letter_tmp)?;
+                f.write_all(&existing)?;
+                f.write_all(new_line.as_bytes())?;
+                f.sync_all()?;
+            }
+            fs::rename(&dead_letter_tmp, &dead_letter_path)?;
+
             // Advance cursor past the orphaned entry.
             inbox::write_offset(&offset_file, entry.end_offset)?;
             // Remove .in-flight.
@@ -369,8 +395,10 @@ mod tests {
 
         // Simulate two separate orphan cycles.
         for entry_text in &["orphan one", "orphan two"] {
-            // Create a fresh inbox for each orphan.
+            // Create a fresh inbox for each orphan — wipe all state including
+            // .responded so the next hook::run starts from a clean slate.
             let _ = fs::remove_file(&inbox);
+            let _ = fs::remove_file(&dir.path().join(".responded"));
             inbox::write_offset(&dir.path().join(".inbox-offset"), 0).unwrap();
             write_line(&inbox, entry_text);
             hook::run(&inbox, &hook::Mode::Drain).unwrap();
@@ -458,5 +486,73 @@ mod tests {
 
         // .in-flight gone. Inbox can now be safely truncated + reset.
         assert!(!in_flight_path.exists());
+    }
+
+    // -------------------------------------------------------------------------
+    // F23: corrupt .in-flight must propagate error (not return NothingToRecover)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn recover_errors_on_corrupt_in_flight() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+        let in_flight_path = in_flight(&dir);
+
+        fs::write(&inbox, "some entry\n").unwrap();
+        fs::write(&in_flight_path, "{not valid json").unwrap();
+
+        let result = recover(&inbox, OrphanPolicy::DeadLetter);
+        assert!(
+            result.is_err(),
+            "recover must propagate error on corrupt .in-flight"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // F24: recover + hook::run re-delivers entry K (end-to-end retry loop)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn retry_followed_by_hook_run_re_delivers_entry_k() {
+        // The contract "retry re-delivers" must be true at the hook level,
+        // not just at the cursor level. This test asserts the full loop.
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+        let in_flight_path = in_flight(&dir);
+
+        write_line(&inbox, "entry K");
+        write_line(&inbox, "entry K+1");
+
+        // Tick 1: deliver K. Writes .in-flight + .responded.
+        let d1 = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        assert_eq!(d1, hook::Decision::Block("entry K".to_string()));
+        assert!(in_flight_path.exists());
+
+        // Simulate: session crashes. Recover with retry.
+        // recover removes .in-flight and resets cursor; it does NOT remove
+        // .responded — that is the launcher's responsibility before the next
+        // session starts (same cleanup a launcher does on session start).
+        let outcome = recover(&inbox, OrphanPolicy::Retry).unwrap();
+        match &outcome {
+            RecoveryOutcome::ReQueued { .. } => {}
+            other => panic!("expected ReQueued, got {:?}", other),
+        }
+        assert!(!in_flight_path.exists());
+
+        // Launcher cleanup: remove .responded before launching new session.
+        // Without this, the hook sees .responded without .in-flight (F12 error).
+        let _ = fs::remove_file(dir.path().join(".responded"));
+
+        // Next hook::run (new session, clean state) must re-deliver K.
+        let d2 = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        assert_eq!(
+            d2,
+            hook::Decision::Block("entry K".to_string()),
+            "hook must re-deliver entry K after retry recovery"
+        );
+
+        // After ack (second tick), K+1 should come next.
+        let d3 = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        assert_eq!(d3, hook::Decision::Block("entry K+1".to_string()));
     }
 }

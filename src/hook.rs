@@ -83,19 +83,31 @@ pub fn run(inbox_path: &Path, mode: &Mode) -> io::Result<Decision> {
         //   4. Read next entry (deferred — no cursor advance yet).
         //   5. If found: write new .in-flight, touch .responded, emit Block.
         //   6. If empty: emit Approve / IdleTick.
-        let end_offset = if let Some(entry) = InFlightEntry::read_from(&in_flight_path)? {
-            entry.end_offset
-        } else {
-            // .in-flight missing but .responded exists — shouldn't happen in
-            // normal operation but can occur if someone manually cleaned up.
-            // Gracefully fall through: read offset to determine where we are.
-            inbox::read_offset(&offset_file).unwrap_or(0)
+        let in_flight_entry = match InFlightEntry::read_from(&in_flight_path)? {
+            Some(entry) => entry,
+            None => {
+                // .responded exists but .in-flight is missing. This is an
+                // inconsistent on-disk state — the most likely cause is an
+                // operator manually removing .in-flight to "unstick" a session.
+                // Silently proceeding would re-deliver the entry at the current
+                // cursor position, which the agent already processed.
+                //
+                // Return an error instead so the failure is visible. The hook's
+                // fail-open handler in main.rs will emit this to stderr and
+                // approve the stop. Operator should run `heartbeat-stop recover`
+                // to clean up before launching a new session.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "inconsistent state: .responded present without .in-flight; \
+                     run `heartbeat-stop recover --inbox <path>` to resolve",
+                ));
+            }
         };
 
-        // Step 1: acknowledge (advance cursor, remove .in-flight).
-        inbox::acknowledge(&offset_file, end_offset, &in_flight_path)?;
+        // Ack-step 1: advance cursor past the in-flight entry, remove .in-flight.
+        inbox::acknowledge(&offset_file, in_flight_entry.end_offset, &in_flight_path)?;
 
-        // Step 2: remove .responded.
+        // Ack-step 2: remove .responded.
         let _ = fs::remove_file(&responded_flag);
 
         // Step 3: check for next entry.
@@ -469,5 +481,43 @@ mod tests {
         let out = serialize(&Decision::IdleTick);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["decision"], "block");
+    }
+
+    // -------------------------------------------------------------------------
+    // F12 regression: .responded without .in-flight must error, not re-deliver
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn responded_without_in_flight_returns_error() {
+        // Operator manually removes .in-flight while .responded is present.
+        // Previously the hook would silently re-deliver the entry at the
+        // current cursor. Now it must return an explicit error so the failure
+        // is visible in stderr and the operator is directed to `recover`.
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+
+        write_line(&inbox, "entry K");
+
+        // Tick 1: deliver. Writes .in-flight + .responded.
+        run(&inbox, &Mode::Drain).unwrap();
+        assert!(in_flight(&dir).exists());
+        assert!(responded(&dir).exists());
+
+        // Simulate: operator removes .in-flight to "unstick" the session.
+        fs::remove_file(in_flight(&dir)).unwrap();
+
+        // Tick 2: hook sees .responded without .in-flight. Must return Err.
+        let result = run(&inbox, &Mode::Drain);
+        assert!(
+            result.is_err(),
+            "hook must error on .responded without .in-flight, not silently re-deliver"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("inconsistent state"),
+            "error message must name the inconsistency: {}",
+            err
+        );
     }
 }

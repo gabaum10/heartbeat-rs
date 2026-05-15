@@ -83,18 +83,26 @@ pub fn read_next_entry(inbox: &Path, offset_file: &Path) -> io::Result<Option<In
         let mut buf = vec![0u8; remaining];
         file.read_exact(&mut buf)?;
 
-        let raw = String::from_utf8_lossy(&buf);
-
-        // Consume exactly one line. If there's a newline, stop there.
-        // If there's no newline, consume the whole remainder (partial write
-        // case — heartbeat.js handles this the same way).
-        let (line, consumed) = match raw.find('\n') {
-            Some(nl) => (&raw[..nl], nl + 1),
-            None => (&raw[..], raw.len()),
+        // Find the newline at the BYTE level before any UTF-8 decode.
+        // String::from_utf8_lossy substitutes 3-byte U+FFFD for each invalid
+        // byte sequence, shifting char-level indices relative to the raw buffer.
+        // Searching for '\n' in the lossy string would yield a character index
+        // that is up to (3×N - N) bytes off for N invalid bytes before the
+        // newline. Fix: search buf for b'\n' first, then decode only the
+        // line-content slice. Lossy decode is safe for content display;
+        // it must not be used for offset arithmetic.
+        let (line_bytes, consumed) = match buf.iter().position(|&b| b == b'\n') {
+            Some(nl) => (&buf[..nl], nl + 1),
+            // No newline — consume the whole remainder (partial write case;
+            // heartbeat.js handles this the same way). The full buffer is the
+            // line content; no trailing byte to strip.
+            None => (&buf[..], buf.len()),
         };
 
         let end_offset = start_offset + consumed as u64;
 
+        // Decode only the line bytes (newline already excluded above).
+        let line = String::from_utf8_lossy(line_bytes);
         let line = line.trim();
         if line.is_empty() {
             // Blank line — advance past it immediately (no content to lose).
@@ -466,6 +474,71 @@ mod tests {
         // Don't create .in-flight — simulate the already-removed case.
         acknowledge(&offset_file, 10, &in_flight).unwrap();
         assert_eq!(read_offset(&offset_file).unwrap(), 10);
+    }
+
+    // -------------------------------------------------------------------------
+    // F6 regression: invalid UTF-8 before newline must not misalign cursor
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn invalid_utf8_before_newline_cursor_stays_aligned() {
+        // Reproduce Lens F6: buf = b"hel\xFFlo\nworld"
+        // Lossy decode makes \xFF a 3-byte replacement char, shifting the
+        // apparent newline position from byte 6 to char index 8.
+        // With byte-level newline search, consumed must be 7 (not 9).
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir, "inbox.jsonl");
+        let offset = dir.path().join(".inbox-offset");
+
+        // Write two lines, first containing an invalid UTF-8 byte.
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&inbox)
+            .unwrap();
+        f.write_all(b"hel\xFFlo\nworld\n").unwrap();
+        drop(f);
+
+        let e1 = read_next_entry(&inbox, &offset).unwrap().unwrap();
+        // Content is lossy-decoded but the byte offsets are what matter here.
+        assert_eq!(e1.start_offset, 0);
+        assert_eq!(e1.end_offset, 7, "consumed must be 7 bytes (6 content + 1 newline)");
+
+        ack(&dir, &e1);
+
+        // Second entry must start at byte 7, not 9.
+        let e2 = read_next_entry(&inbox, &offset).unwrap().unwrap();
+        assert_eq!(e2.start_offset, 7);
+        assert_eq!(e2.decoded, "world");
+        ack(&dir, &e2);
+
+        assert_eq!(read_next_entry(&inbox, &offset).unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_utf8_no_newline_cursor_stays_aligned() {
+        // No-newline path: buf = b"bad\xFFbytes" — entire buffer is one entry.
+        // consumed must equal buf.len(), not buf.len() - 1.
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir, "inbox.jsonl");
+        let offset = dir.path().join(".inbox-offset");
+
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&inbox)
+            .unwrap();
+        f.write_all(b"bad\xFFbytes").unwrap();
+        drop(f);
+
+        let e1 = read_next_entry(&inbox, &offset).unwrap().unwrap();
+        assert_eq!(e1.start_offset, 0);
+        assert_eq!(e1.end_offset, 9, "consumed must be 9 bytes (entire buffer)");
+        assert!(e1.decoded.contains("bad"), "content prefix preserved: {}", e1.decoded);
+        assert!(e1.decoded.contains("bytes"), "content suffix preserved: {}", e1.decoded);
+
+        ack(&dir, &e1);
+        assert_eq!(read_next_entry(&inbox, &offset).unwrap(), None);
     }
 
     // -------------------------------------------------------------------------
