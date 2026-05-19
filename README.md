@@ -41,6 +41,14 @@ cargo build --release
 cp target/release/heartbeat-stop ~/.local/bin/
 ```
 
+After cloning, activate the git hooks:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This enables the `cargo fmt` pre-commit check. Run `cargo fmt` before committing if the hook rejects your changes.
+
 ## Usage
 
 ```bash

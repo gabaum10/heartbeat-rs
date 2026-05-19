@@ -28,6 +28,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::{HeartbeatError, Result};
+
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -65,30 +67,45 @@ impl InFlightEntry {
     }
 
     /// Write this entry to `path` atomically (tmp + fsync + rename).
-    pub fn write_to(&self, path: &Path) -> io::Result<()> {
+    pub fn write_to(&self, path: &Path) -> Result<()> {
         let tmp = path.with_extension("tmp");
+        let write_err = |e: io::Error| HeartbeatError::InFlightWrite {
+            path: path.to_owned(),
+            source: e,
+        };
         {
-            let mut f = fs::File::create(&tmp)?;
+            let mut f = fs::File::create(&tmp).map_err(write_err)?;
+            // serde_json::to_string only fails on non-serializable types; our
+            // struct derives Serialize so this is infallible in practice.
+            // Map it to an IO error anyway for the rare edge case.
             let json = serde_json::to_string(self)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            f.write_all(json.as_bytes())?;
-            f.sync_all()?;
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                .map_err(write_err)?;
+            f.write_all(json.as_bytes()).map_err(write_err)?;
+            f.sync_all().map_err(write_err)?;
         }
-        fs::rename(&tmp, path)?;
+        fs::rename(&tmp, path).map_err(write_err)?;
         Ok(())
     }
 
-    /// Read and parse an `.in-flight` file. Returns `None` if the file does
-    /// not exist. Propagates IO/parse errors otherwise.
-    pub fn read_from(path: &Path) -> io::Result<Option<Self>> {
+    /// Read and parse an `.in-flight` file. Returns `Ok(None)` if the file
+    /// does not exist. Returns `Err(InFlightCorrupt)` for JSON parse errors.
+    /// Returns `Err(InFlightRead)` for other IO errors.
+    pub fn read_from(path: &Path) -> Result<Option<Self>> {
         match fs::read_to_string(path) {
             Ok(s) => {
-                let entry: InFlightEntry = serde_json::from_str(&s)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let entry: InFlightEntry =
+                    serde_json::from_str(&s).map_err(|e| HeartbeatError::InFlightCorrupt {
+                        path: path.to_owned(),
+                        source: e,
+                    })?;
                 Ok(Some(entry))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+            Err(e) => Err(HeartbeatError::InFlightRead {
+                path: path.to_owned(),
+                source: e,
+            }),
         }
     }
 
@@ -266,5 +283,56 @@ mod tests {
             !tmp.exists(),
             ".in-flight.tmp must be cleaned up after rename"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // NEW: error-path tests for typed HeartbeatError variants (lil-grabby §9)
+    // -------------------------------------------------------------------------
+
+    /// Test 4 (§9.4): corrupt .in-flight JSON → read_from →
+    /// Err(HeartbeatError::InFlightCorrupt { path, source }) with correct path.
+    #[test]
+    fn corrupt_in_flight_json_read_from_returns_in_flight_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".in-flight");
+
+        // Write invalid JSON to .in-flight.
+        fs::write(&path, "{not valid json at all").unwrap();
+
+        let result = InFlightEntry::read_from(&path);
+        match result {
+            Err(crate::error::HeartbeatError::InFlightCorrupt {
+                path: err_path,
+                source: _,
+            }) => {
+                assert_eq!(
+                    err_path, path,
+                    "InFlightCorrupt path must be the .in-flight file path"
+                );
+            }
+            other => panic!(
+                "expected Err(HeartbeatError::InFlightCorrupt), got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Extra: truncated/empty file → read_from → Err(InFlightCorrupt).
+    /// An empty file is valid UTF-8 but invalid JSON — same variant.
+    #[test]
+    fn empty_in_flight_file_returns_in_flight_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".in-flight");
+
+        fs::write(&path, "").unwrap();
+
+        let result = InFlightEntry::read_from(&path);
+        match result {
+            Err(crate::error::HeartbeatError::InFlightCorrupt { .. }) => {}
+            other => panic!(
+                "expected Err(HeartbeatError::InFlightCorrupt) for empty file, got {:?}",
+                other
+            ),
+        }
     }
 }
