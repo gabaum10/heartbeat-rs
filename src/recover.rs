@@ -599,7 +599,10 @@ mod tests {
                     "content must be the trimmed string that failed to parse"
                 );
             }
-            other => panic!("expected Err(HeartbeatError::OffsetCorrupt), got {:?}", other),
+            other => panic!(
+                "expected Err(HeartbeatError::OffsetCorrupt), got {:?}",
+                other
+            ),
         }
     }
 
