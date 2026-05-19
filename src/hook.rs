@@ -34,6 +34,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::{HeartbeatError, Result};
 use crate::in_flight::{self, InFlightEntry};
@@ -63,10 +64,15 @@ pub enum Decision {
 ///
 /// `inbox_path` — path to the JSONL inbox file.
 /// `mode` — drain or persist.
+/// `idle_interval_secs` — seconds to sleep before emitting an idle tick in
+///   persist mode. Only applied when the inbox is empty and no real message
+///   is pending. The first check of the inbox is always immediate; this delay
+///   governs the gap between consecutive idle ticks. Use 0 to disable sleeping
+///   (tests and low-latency consumers).
 ///
 /// Returns the decision. The caller is responsible for writing output and
 /// exiting.
-pub fn run(inbox_path: &Path, mode: &Mode) -> Result<Decision> {
+pub fn run(inbox_path: &Path, mode: &Mode, idle_interval_secs: u64) -> Result<Decision> {
     let io_dir = inbox_path.parent().unwrap_or(Path::new("."));
     let responded_flag = io_dir.join(".responded");
     let offset_file = inbox::offset_file_for(inbox_path);
@@ -125,7 +131,7 @@ pub fn run(inbox_path: &Path, mode: &Mode) -> Result<Decision> {
             }
             None => {
                 // Inbox drained. Session ends in drain mode, idle tick in persist.
-                return Ok(approve_or_idle(mode));
+                return Ok(approve_or_idle(mode, idle_interval_secs));
             }
         }
     }
@@ -142,7 +148,7 @@ pub fn run(inbox_path: &Path, mode: &Mode) -> Result<Decision> {
             touch(&responded_flag)?;
             Ok(Decision::Block(entry.decoded))
         }
-        None => Ok(approve_or_idle(mode)),
+        None => Ok(approve_or_idle(mode, idle_interval_secs)),
     }
 }
 
@@ -171,10 +177,15 @@ pub fn serialize(decision: &Decision) -> String {
     }
 }
 
-fn approve_or_idle(mode: &Mode) -> Decision {
+fn approve_or_idle(mode: &Mode, idle_interval_secs: u64) -> Decision {
     match mode {
         Mode::Drain => Decision::Approve,
-        Mode::Persist => Decision::IdleTick,
+        Mode::Persist => {
+            if idle_interval_secs > 0 {
+                std::thread::sleep(Duration::from_secs(idle_interval_secs));
+            }
+            Decision::IdleTick
+        }
     }
 }
 
@@ -244,7 +255,7 @@ mod tests {
 
         write_line(&inbox, "triage these emails please");
 
-        let decision = run(&inbox, &Mode::Drain).unwrap();
+        let decision = run(&inbox, &Mode::Drain, 0).unwrap();
         assert_eq!(
             decision,
             Decision::Block("triage these emails please".to_string())
@@ -264,7 +275,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let inbox = make_inbox(&dir);
 
-        let decision = run(&inbox, &Mode::Drain).unwrap();
+        let decision = run(&inbox, &Mode::Drain, 0).unwrap();
         assert_eq!(decision, Decision::Approve);
     }
 
@@ -273,7 +284,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let inbox = make_inbox(&dir);
 
-        let decision = run(&inbox, &Mode::Persist).unwrap();
+        let decision = run(&inbox, &Mode::Persist, 0).unwrap();
         assert_eq!(decision, Decision::IdleTick);
     }
 
@@ -291,7 +302,7 @@ mod tests {
 
         // Simulate: first message was delivered, .in-flight written, .responded set.
         // We do this by running hook for the first time.
-        let first = run(&inbox, &Mode::Drain).unwrap();
+        let first = run(&inbox, &Mode::Drain, 0).unwrap();
         assert_eq!(first, Decision::Block("message one".to_string()));
         assert!(responded(&dir).exists());
         assert!(in_flight(&dir).exists());
@@ -301,7 +312,7 @@ mod tests {
         assert_eq!(cur, 0, "cursor must not advance on delivery in Fix B");
 
         // Now simulate: agent responded. Hook fires again.
-        let second = run(&inbox, &Mode::Drain).unwrap();
+        let second = run(&inbox, &Mode::Drain, 0).unwrap();
         assert_eq!(second, Decision::Block("message two".to_string()));
 
         // .responded should exist for next round.
@@ -319,10 +330,10 @@ mod tests {
         write_line(&inbox, "only message");
 
         // First tick: deliver.
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
 
         // Second tick: agent replied, inbox empty → approve.
-        let decision = run(&inbox, &Mode::Drain).unwrap();
+        let decision = run(&inbox, &Mode::Drain, 0).unwrap();
         assert_eq!(decision, Decision::Approve);
 
         // .responded and .in-flight should both be gone.
@@ -336,9 +347,9 @@ mod tests {
         let inbox = make_inbox(&dir);
 
         write_line(&inbox, "only message");
-        run(&inbox, &Mode::Persist).unwrap();
+        run(&inbox, &Mode::Persist, 0).unwrap();
 
-        let decision = run(&inbox, &Mode::Persist).unwrap();
+        let decision = run(&inbox, &Mode::Persist, 0).unwrap();
         assert_eq!(decision, Decision::IdleTick);
     }
 
@@ -357,7 +368,7 @@ mod tests {
         assert_eq!(inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0), 0);
 
         // Tick 1: delivery. Cursor must remain at 0.
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
         assert_eq!(
             inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0),
             0,
@@ -365,7 +376,7 @@ mod tests {
         );
 
         // Tick 2: ack + approve. Cursor must advance past entry A.
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
         let after = inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0);
         assert!(after > 0, "cursor must advance after ack");
     }
@@ -378,11 +389,11 @@ mod tests {
         write_line(&inbox, "entry");
 
         // Tick 1: deliver → .in-flight written.
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
         assert!(in_flight(&dir).exists());
 
         // Tick 2: ack → .in-flight removed.
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
         assert!(!in_flight(&dir).exists());
     }
 
@@ -401,7 +412,7 @@ mod tests {
         write_line(&inbox, "entry K");
 
         // Deliver entry K (writes .in-flight + .responded).
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
 
         // Simulate: launcher crashes. .in-flight and .responded both present.
         // Cursor at 0 (entry K's start_offset).
@@ -427,7 +438,7 @@ mod tests {
 
         write_line(&inbox, "entry K");
 
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
 
         // Agent crash: both artifacts present, cursor unmoved.
         assert!(responded(&dir).exists());
@@ -450,7 +461,7 @@ mod tests {
         write_line(&inbox, "entry K\n");
 
         // Deliver entry K.
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
         let inf_before = InFlightEntry::read_from(&in_flight(&dir)).unwrap().unwrap();
 
         // Simulate: ack step 1 succeeded (cursor advanced), step 2 did not.
@@ -514,7 +525,7 @@ mod tests {
         write_line(&inbox, "entry K");
 
         // Tick 1: deliver. Writes .in-flight + .responded.
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
         assert!(in_flight(&dir).exists());
         assert!(responded(&dir).exists());
 
@@ -522,7 +533,7 @@ mod tests {
         fs::remove_file(in_flight(&dir)).unwrap();
 
         // Tick 2: hook sees .responded without .in-flight. Must return Err.
-        let result = run(&inbox, &Mode::Drain);
+        let result = run(&inbox, &Mode::Drain, 0);
         assert!(
             result.is_err(),
             "hook must error on .responded without .in-flight, not silently re-deliver"
@@ -559,13 +570,13 @@ mod tests {
         // Create .responded but no .in-flight.
         write_line(&inbox, "msg");
         // Tick 1: deliver (creates both .responded and .in-flight).
-        run(&inbox, &Mode::Drain).unwrap();
+        run(&inbox, &Mode::Drain, 0).unwrap();
         // Remove .in-flight only.
         fs::remove_file(in_flight(&dir)).unwrap();
         assert!(responded(&dir).exists());
         assert!(!in_flight(&dir).exists());
 
-        let result = run(&inbox, &Mode::Drain);
+        let result = run(&inbox, &Mode::Drain, 0);
         match result {
             Err(HeartbeatError::InconsistentState { io_dir }) => {
                 // io_dir must be inbox's parent directory.
