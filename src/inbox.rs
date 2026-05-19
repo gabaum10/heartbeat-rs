@@ -22,6 +22,7 @@
 //!
 //! Algorithm lifted from claude-heartbeat/hooks/heartbeat.js lines 54-78.
 
+use crate::error::{HeartbeatError, Result};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -46,23 +47,23 @@ pub struct InboxEntry {
 /// Reads the next unread entry from the inbox file WITHOUT advancing the
 /// offset cursor.
 ///
-/// Returns `Some(InboxEntry)` if an entry was available, `None` if the inbox
-/// is empty or fully consumed. The caller must call `acknowledge` after
-/// the agent has processed the entry.
+/// Returns `Ok(Some(InboxEntry))` if an entry was available, `Ok(None)` if
+/// the inbox is empty or fully consumed. The caller must call `acknowledge`
+/// after the agent has processed the entry.
 ///
 /// `inbox` is the path to the JSONL file.
 /// `offset_file` is the path to the `.inbox-offset` cursor file (usually
 /// in the same directory as the inbox).
-pub fn read_next_entry(inbox: &Path, offset_file: &Path) -> io::Result<Option<InboxEntry>> {
+pub fn read_next_entry(inbox: &Path, offset_file: &Path) -> Result<Option<InboxEntry>> {
     // How large is the inbox right now? Snapshot once — the file may grow
     // while we run, but we only consume up to this boundary.
     let size = match fs::metadata(inbox) {
         Ok(m) => m.len(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+        Err(e) => return Err(HeartbeatError::InboxRead(e)),
     };
 
-    let mut file = fs::File::open(inbox)?;
+    let mut file = fs::File::open(inbox).map_err(HeartbeatError::InboxRead)?;
 
     // Loop so blank lines are skipped rather than causing a premature None.
     // Each iteration reads from the current offset and either advances past
@@ -70,18 +71,25 @@ pub fn read_next_entry(inbox: &Path, offset_file: &Path) -> io::Result<Option<In
     //
     // NOTE: blank lines DO advance the offset immediately, since there is
     // nothing for the agent to process and no risk of data loss.
+    //
+    // NOTE: write_offset errors inside this loop surface as OffsetWrite, not
+    // InboxRead — callers matching on HeartbeatError variants should handle
+    // both when processing read_next_entry results.
     loop {
-        let start_offset: u64 = read_offset(offset_file).unwrap_or(0);
+        // Propagate OffsetCorrupt and OffsetRead; Ok(None) → 0.
+        let start_offset: u64 = read_offset(offset_file)?.unwrap_or_default();
 
         if size <= start_offset {
             return Ok(None);
         }
 
-        file.seek(SeekFrom::Start(start_offset))?;
+        file.seek(SeekFrom::Start(start_offset))
+            .map_err(HeartbeatError::InboxRead)?;
 
         let remaining = (size - start_offset) as usize;
         let mut buf = vec![0u8; remaining];
-        file.read_exact(&mut buf)?;
+        file.read_exact(&mut buf)
+            .map_err(HeartbeatError::InboxRead)?;
 
         // Find the newline at the BYTE level before any UTF-8 decode.
         // String::from_utf8_lossy substitutes 3-byte U+FFFD for each invalid
@@ -134,12 +142,15 @@ pub fn read_next_entry(inbox: &Path, offset_file: &Path) -> io::Result<Option<In
 /// `offset_file` — path to the `.inbox-offset` cursor file.
 /// `new_offset` — the `end_offset` from the `InboxEntry` being acknowledged.
 /// `in_flight_path` — path to the `.in-flight` artifact to remove.
-pub fn acknowledge(offset_file: &Path, new_offset: u64, in_flight_path: &Path) -> io::Result<()> {
+pub fn acknowledge(offset_file: &Path, new_offset: u64, in_flight_path: &Path) -> Result<()> {
     // Defense-in-depth: never rewind the cursor. If new_offset is behind the
     // current cursor (e.g., stale .in-flight was fed to acknowledge after a
     // partial recover), skip the write rather than causing re-delivery of
     // already-acknowledged entries.
-    let current = read_offset(offset_file).unwrap_or(0);
+    //
+    // Propagate OffsetCorrupt and OffsetRead; Ok(None) → treat as 0 (no cursor
+    // yet written means nothing to protect against rewinding).
+    let current: u64 = read_offset(offset_file)?.unwrap_or_default();
     if new_offset < current {
         // Cursor would rewind — skip advance, still remove .in-flight.
         let _ = fs::remove_file(in_flight_path);
@@ -170,22 +181,58 @@ fn decode_line(line: &str) -> String {
 }
 
 /// Reads the current byte offset from the offset file.
-/// Returns `None` if the file doesn't exist or can't be parsed.
-pub fn read_offset(offset_file: &Path) -> Option<u64> {
-    fs::read_to_string(offset_file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+///
+/// - `Ok(None)` — file does not exist (caller should use 0).
+/// - `Ok(Some(n))` — file exists and parsed successfully.
+/// - `Err(OffsetCorrupt)` — file exists but content is not a valid u64.
+/// - `Err(OffsetRead)` — file exists but IO error (other than NotFound).
+pub fn read_offset(offset_file: &Path) -> Result<Option<u64>> {
+    let content = match fs::read_to_string(offset_file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(HeartbeatError::OffsetRead {
+                path: offset_file.to_owned(),
+                source: e,
+            })
+        }
+    };
+    let trimmed = content.trim();
+    match trimmed.parse::<u64>() {
+        Ok(n) => Ok(Some(n)),
+        Err(_) => Err(HeartbeatError::OffsetCorrupt {
+            path: offset_file.to_owned(),
+            content: trimmed.to_owned(),
+        }),
+    }
 }
 
 /// Writes the byte offset to the offset file with fsync for crash safety.
-pub fn write_offset(offset_file: &Path, offset: u64) -> io::Result<()> {
+///
+/// Uses tmp + fsync + rename for atomicity. All errors map to
+/// `OffsetWrite { path, source }` where `path` is the offset file (not the
+/// tmp file) — actionable at 3am.
+pub fn write_offset(offset_file: &Path, offset: u64) -> Result<()> {
     let tmp = offset_file.with_extension("tmp");
+    let map_err = |e: io::Error| HeartbeatError::OffsetWrite {
+        path: offset_file.to_owned(),
+        source: e,
+    };
     {
-        let mut f = fs::File::create(&tmp)?;
-        write!(f, "{}", offset)?;
-        f.sync_all()?;
+        let mut f = fs::File::create(&tmp).map_err(map_err)?;
+        write!(f, "{}", offset).map_err(|e| HeartbeatError::OffsetWrite {
+            path: offset_file.to_owned(),
+            source: e,
+        })?;
+        f.sync_all().map_err(|e| HeartbeatError::OffsetWrite {
+            path: offset_file.to_owned(),
+            source: e,
+        })?;
     }
-    fs::rename(&tmp, offset_file)?;
+    fs::rename(&tmp, offset_file).map_err(|e| HeartbeatError::OffsetWrite {
+        path: offset_file.to_owned(),
+        source: e,
+    })?;
     Ok(())
 }
 
@@ -456,7 +503,7 @@ mod tests {
 
         acknowledge(&offset_file, 42, &in_flight).unwrap();
 
-        let written = read_offset(&offset_file).unwrap();
+        let written = read_offset(&offset_file).unwrap().unwrap();
         assert_eq!(written, 42);
         assert!(!in_flight.exists(), ".in-flight should be removed on ack");
     }
@@ -469,7 +516,7 @@ mod tests {
         let in_flight = dir.path().join(".in-flight");
         // Don't create .in-flight — simulate the already-removed case.
         acknowledge(&offset_file, 10, &in_flight).unwrap();
-        assert_eq!(read_offset(&offset_file).unwrap(), 10);
+        assert_eq!(read_offset(&offset_file).unwrap().unwrap(), 10);
     }
 
     // -------------------------------------------------------------------------
@@ -592,10 +639,10 @@ mod tests {
         inflight.write_to(&in_flight).unwrap();
 
         // Offset is still at 0 (start of K) — not advanced.
-        assert_eq!(read_offset(&offset), None); // no offset file means 0
+        assert_eq!(read_offset(&offset).unwrap(), None); // no offset file means 0
 
         // .in-flight exists with start_offset == 0, cursor at 0 → live orphan.
-        let current_offset = read_offset(&offset).unwrap_or(0);
+        let current_offset = read_offset(&offset).unwrap().unwrap_or(0);
         assert!(!inflight.is_stale(current_offset), "should be live orphan");
 
         // Next read would re-deliver K (correct — agent never saw it).
@@ -624,7 +671,7 @@ mod tests {
         inflight.write_to(&in_flight).unwrap();
 
         // Agent responded, but hook crashed before ack. Cursor still at 0.
-        let current_offset = read_offset(&offset).unwrap_or(0);
+        let current_offset = read_offset(&offset).unwrap().unwrap_or(0);
 
         // Live orphan: cursor (0) <= end_offset (8) → not stale.
         assert!(!inflight.is_stale(current_offset));
@@ -663,7 +710,7 @@ mod tests {
 
         // Now launcher reads .in-flight and checks against cursor.
         let read_back = InFlightEntry::read_from(&in_flight).unwrap().unwrap();
-        let current_offset = read_offset(&offset).unwrap();
+        let current_offset = read_offset(&offset).unwrap().unwrap();
 
         // cursor == end_offset: is_stale uses >= so this IS stale.
         // The entry was acknowledged in step 1; .in-flight just wasn't cleaned up.
@@ -671,5 +718,105 @@ mod tests {
 
         // Strictly before end_offset: not stale.
         assert!(!read_back.is_stale(current_offset - 1));
+    }
+
+    // -------------------------------------------------------------------------
+    // NEW: error-path tests for typed HeartbeatError variants (lil-grabby §9)
+    // -------------------------------------------------------------------------
+
+    /// Test 1 (§9.1): corrupt offset file → read_next_entry →
+    /// Err(HeartbeatError::OffsetCorrupt { path, content }) with correct fields.
+    #[test]
+    fn corrupt_offset_read_next_entry_returns_offset_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir, "inbox.jsonl");
+        let offset_file = dir.path().join(".inbox-offset");
+
+        // Write a real inbox so we get past the metadata check.
+        write_inbox(&inbox, "some entry\n");
+        // Write a corrupt offset — not a valid u64.
+        fs::write(&offset_file, "notanumber").unwrap();
+
+        let result = read_next_entry(&inbox, &offset_file);
+        match result {
+            Err(crate::error::HeartbeatError::OffsetCorrupt { path, content }) => {
+                assert_eq!(path, offset_file, "path must be the offset file path");
+                assert_eq!(
+                    content, "notanumber",
+                    "content must be the trimmed string that failed to parse"
+                );
+            }
+            other => panic!("expected OffsetCorrupt, got {:?}", other),
+        }
+    }
+
+    /// Test 2 (§9.2): corrupt offset file → acknowledge →
+    /// Err(HeartbeatError::OffsetCorrupt { path, content }).
+    #[test]
+    fn corrupt_offset_acknowledge_returns_offset_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let offset_file = dir.path().join(".inbox-offset");
+        let in_flight = dir.path().join(".in-flight");
+
+        // Write a corrupt offset.
+        fs::write(&offset_file, "CORRUPT_BYTES").unwrap();
+
+        let result = acknowledge(&offset_file, 42, &in_flight);
+        match result {
+            Err(crate::error::HeartbeatError::OffsetCorrupt { path, content }) => {
+                assert_eq!(path, offset_file, "path must be the offset file path");
+                assert_eq!(
+                    content, "CORRUPT_BYTES",
+                    "content must be the trimmed string that failed to parse"
+                );
+            }
+            other => panic!("expected OffsetCorrupt, got {:?}", other),
+        }
+    }
+
+    /// Optional (§9 encouraged): offset file with extra whitespace/newlines
+    /// parses successfully — regression for trim-before-parse.
+    #[test]
+    fn offset_with_whitespace_and_newline_parses_ok() {
+        let dir = TempDir::new().unwrap();
+        let offset_file = dir.path().join(".inbox-offset");
+
+        // Write offset with surrounding whitespace and newline (common from echo).
+        fs::write(&offset_file, "  42  \n").unwrap();
+
+        let result = read_offset(&offset_file).unwrap();
+        assert_eq!(
+            result,
+            Some(42),
+            "offset with surrounding whitespace must parse as 42"
+        );
+    }
+
+    /// Consumer-style test demonstrating the §7 warn-and-fallback explicit-match
+    /// pattern. The library returns Err(OffsetCorrupt); the consumer decides to
+    /// warn and fall back to 0 rather than propagating.
+    #[test]
+    fn consumer_warn_and_fallback_explicit_match_pattern() {
+        let dir = TempDir::new().unwrap();
+        let offset_file = dir.path().join(".inbox-offset");
+
+        // Corrupt offset.
+        fs::write(&offset_file, "definitely-not-a-number").unwrap();
+
+        // Consumer pattern from §7: explicit match, warn-and-fallback.
+        let mut warned = false;
+        let start_offset = match read_offset(&offset_file) {
+            Ok(None) => 0u64,
+            Ok(Some(n)) => n,
+            Err(crate::error::HeartbeatError::OffsetCorrupt { .. }) => {
+                // In production: eprintln!("heartbeat-stop: warn: {e}; restarting from offset 0");
+                warned = true;
+                0
+            }
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        assert!(warned, "consumer must have detected the corrupt offset");
+        assert_eq!(start_offset, 0, "fallback must be 0");
     }
 }

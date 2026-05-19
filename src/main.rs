@@ -11,6 +11,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use heartbeat_rs::hook;
 use heartbeat_rs::recover::{self, OrphanPolicy};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -119,11 +120,10 @@ fn main() {
             let policy = OrphanPolicy::from(on_orphan);
             match recover::recover(&inbox, policy) {
                 Ok(outcome) => {
-                    // Log outcome to stderr so launchers can capture it.
-                    eprintln!("heartbeat-stop recover: {:?}", outcome);
+                    eprintln!("heartbeat-stop recover: {outcome:?}");
                 }
                 Err(e) => {
-                    eprintln!("heartbeat-stop recover: error: {}", e);
+                    eprintln!("heartbeat-stop recover: {e}");
                     std::process::exit(1);
                 }
             }
@@ -144,16 +144,21 @@ fn main() {
             let decision = match hook::run(&inbox, &mode) {
                 Ok(d) => d,
                 Err(e) => {
-                    // IO errors: log to stderr so they appear in the hook's error stream.
-                    // Approve the stop — safer than blocking indefinitely on a broken inbox.
-                    eprintln!("heartbeat-stop: error reading inbox: {}", e);
+                    eprintln!("heartbeat-stop: error: {e}");
+                    // Fail-open: approve the stop rather than blocking indefinitely.
                     hook::Decision::Approve
                 }
             };
 
             let output = hook::serialize(&decision);
             if !output.is_empty() {
-                print!("{}", output);
+                if let Err(e) = std::io::stdout().write_all(output.as_bytes()) {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        std::process::exit(0);
+                    }
+                    eprintln!("heartbeat-stop: fatal: stdout write failed: {e}");
+                    std::process::exit(1);
+                }
             }
             // Exit 0 in all cases. Claude Code reads stdout for the decision;
             // non-zero exit codes from hooks may be treated as errors.

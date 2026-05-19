@@ -33,9 +33,9 @@
 //! alive indefinitely for a future persistent supervisor.
 
 use std::fs;
-use std::io;
 use std::path::Path;
 
+use crate::error::{HeartbeatError, Result};
 use crate::in_flight::{self, InFlightEntry};
 use crate::inbox;
 
@@ -66,7 +66,7 @@ pub enum Decision {
 ///
 /// Returns the decision. The caller is responsible for writing output and
 /// exiting.
-pub fn run(inbox_path: &Path, mode: &Mode) -> io::Result<Decision> {
+pub fn run(inbox_path: &Path, mode: &Mode) -> Result<Decision> {
     let io_dir = inbox_path.parent().unwrap_or(Path::new("."));
     let responded_flag = io_dir.join(".responded");
     let offset_file = inbox::offset_file_for(inbox_path);
@@ -98,12 +98,12 @@ pub fn run(inbox_path: &Path, mode: &Mode) -> io::Result<Decision> {
                 // run `heartbeat-stop recover` before launching a new session —
                 // recover removes both .in-flight and .responded, fully
                 // clearing this inconsistent state.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "inconsistent state: .responded present without .in-flight; \
-                     run `heartbeat-stop recover --inbox <path> --on-orphan <policy>` \
-                     to clear both artifacts before the next session",
-                ));
+                // InconsistentState carries io_dir so the operator can find
+                // the artifacts that need recovery. The Display impl on
+                // HeartbeatError includes the full recovery instruction.
+                return Err(HeartbeatError::InconsistentState {
+                    io_dir: io_dir.to_owned(),
+                });
             }
         };
 
@@ -178,13 +178,25 @@ fn approve_or_idle(mode: &Mode) -> Decision {
     }
 }
 
-/// Create or touch a flag file.
-fn touch(path: &Path) -> io::Result<()> {
+/// Create or touch a flag file (`.responded`).
+///
+/// Failure mapping note: `.responded` is a delivery-sequence artifact like
+/// `.in-flight`. The error enum has no dedicated `.responded` variant — the
+/// failure table (§4) doesn't enumerate it as a distinct case. We map to
+/// `InFlightWrite` because (a) it's the closest semantic match and (b) the
+/// caller treats the delivery sequence as atomic: failing to touch `.responded`
+/// is equivalent to failing to write `.in-flight`. The path in the error
+/// carries the actual `.responded` path so the operator can diagnose.
+fn touch(path: &Path) -> Result<()> {
     fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(path)?;
+        .open(path)
+        .map_err(|source| HeartbeatError::InFlightWrite {
+            path: path.to_owned(),
+            source,
+        })?;
     Ok(())
 }
 
@@ -285,7 +297,7 @@ mod tests {
         assert!(in_flight(&dir).exists());
 
         // Cursor should NOT be advanced yet (Fix B).
-        let cur = inbox::read_offset(&offset(&dir)).unwrap_or(0);
+        let cur = inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0);
         assert_eq!(cur, 0, "cursor must not advance on delivery in Fix B");
 
         // Now simulate: agent responded. Hook fires again.
@@ -342,19 +354,19 @@ mod tests {
         write_line(&inbox, "entry A");
 
         // Before any tick, cursor is 0.
-        assert_eq!(inbox::read_offset(&offset(&dir)).unwrap_or(0), 0);
+        assert_eq!(inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0), 0);
 
         // Tick 1: delivery. Cursor must remain at 0.
         run(&inbox, &Mode::Drain).unwrap();
         assert_eq!(
-            inbox::read_offset(&offset(&dir)).unwrap_or(0),
+            inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0),
             0,
             "cursor must not advance on delivery"
         );
 
         // Tick 2: ack + approve. Cursor must advance past entry A.
         run(&inbox, &Mode::Drain).unwrap();
-        let after = inbox::read_offset(&offset(&dir)).unwrap_or(0);
+        let after = inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0);
         assert!(after > 0, "cursor must advance after ack");
     }
 
@@ -394,7 +406,7 @@ mod tests {
         // Simulate: launcher crashes. .in-flight and .responded both present.
         // Cursor at 0 (entry K's start_offset).
         let inf = InFlightEntry::read_from(&in_flight(&dir)).unwrap().unwrap();
-        let current_cursor = inbox::read_offset(&offset(&dir)).unwrap_or(0);
+        let current_cursor = inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0);
 
         // Live orphan: cursor at start_offset, not past end_offset.
         assert!(!inf.is_stale(current_cursor));
@@ -420,7 +432,7 @@ mod tests {
         // Agent crash: both artifacts present, cursor unmoved.
         assert!(responded(&dir).exists());
         assert!(in_flight(&dir).exists());
-        let cur = inbox::read_offset(&offset(&dir)).unwrap_or(0);
+        let cur = inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0);
         assert_eq!(cur, 0);
 
         // Same orphan detection as window A.
@@ -446,7 +458,7 @@ mod tests {
         // .in-flight still present (step 2 didn't run).
 
         // Now launcher reads .in-flight and checks cursor.
-        let cur = inbox::read_offset(&offset(&dir)).unwrap();
+        let cur = inbox::read_offset(&offset(&dir)).unwrap().unwrap();
         let inf = InFlightEntry::read_from(&in_flight(&dir)).unwrap().unwrap();
 
         // cursor == end_offset: entry is fully past the cursor.
@@ -516,11 +528,57 @@ mod tests {
             "hook must error on .responded without .in-flight, not silently re-deliver"
         );
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // Error must be the typed InconsistentState variant — not a raw io::Error.
+        assert!(
+            matches!(err, HeartbeatError::InconsistentState { .. }),
+            "expected InconsistentState variant, got: {:?}",
+            err
+        );
+        // Display impl (via thiserror) must name the inconsistency.
         assert!(
             err.to_string().contains("inconsistent state"),
             "error message must name the inconsistency: {}",
             err
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // NEW: Optional hook.rs test — InconsistentState variant (lil-grabby §9)
+    // -------------------------------------------------------------------------
+
+    /// Optional (§9 encouraged): .responded present without .in-flight →
+    /// run → Err(HeartbeatError::InconsistentState { io_dir }) with correct dir.
+    ///
+    /// This is a tighter version of responded_without_in_flight_returns_error,
+    /// directly asserting the typed variant and the io_dir field.
+    #[test]
+    fn responded_without_in_flight_returns_inconsistent_state_with_io_dir() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+
+        // Create .responded but no .in-flight.
+        write_line(&inbox, "msg");
+        // Tick 1: deliver (creates both .responded and .in-flight).
+        run(&inbox, &Mode::Drain).unwrap();
+        // Remove .in-flight only.
+        fs::remove_file(in_flight(&dir)).unwrap();
+        assert!(responded(&dir).exists());
+        assert!(!in_flight(&dir).exists());
+
+        let result = run(&inbox, &Mode::Drain);
+        match result {
+            Err(HeartbeatError::InconsistentState { io_dir }) => {
+                // io_dir must be inbox's parent directory.
+                assert_eq!(
+                    io_dir,
+                    inbox.parent().unwrap(),
+                    "io_dir must be the parent directory of the inbox"
+                );
+            }
+            other => panic!(
+                "expected Err(HeartbeatError::InconsistentState {{ io_dir }}), got {:?}",
+                other
+            ),
+        }
     }
 }

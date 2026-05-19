@@ -57,6 +57,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::error::{HeartbeatError, Result};
 use crate::in_flight::{self, InFlightEntry};
 use crate::inbox;
 
@@ -98,7 +99,7 @@ pub enum RecoveryOutcome {
 /// to remove `.responded` separately.
 ///
 /// Returns a `RecoveryOutcome` describing what happened.
-pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOutcome> {
+pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> Result<RecoveryOutcome> {
     let io_dir = inbox_path.parent().unwrap_or(Path::new("."));
     let in_flight_path = in_flight::in_flight_file_for(inbox_path);
     let responded_flag = io_dir.join(".responded");
@@ -121,13 +122,13 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
         }
     };
 
-    let current_offset = inbox::read_offset(&offset_file).unwrap_or(0);
+    let current_offset: u64 = inbox::read_offset(&offset_file)?.unwrap_or_default();
 
     // Stale orphan: cursor already advanced past the entry's end.
     // Crash occurred between ack step 1 (cursor advance) and step 2
     // (.in-flight removal). Entry was already acknowledged — clean up both.
     if current_offset >= entry.end_offset {
-        fs::remove_file(&in_flight_path)?;
+        let _ = fs::remove_file(&in_flight_path);
         let _ = fs::remove_file(&responded_flag);
         return Ok(RecoveryOutcome::StaleOrphanDeleted {
             entry_id: entry.entry_id,
@@ -153,7 +154,7 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
             // agent layer. See spec §6 risk #5.
             inbox::write_offset(&offset_file, entry.start_offset)?;
             // Remove .in-flight — it will be rewritten on next delivery tick.
-            fs::remove_file(&in_flight_path)?;
+            let _ = fs::remove_file(&in_flight_path);
             // Remove .responded so the next session starts without the F12
             // inconsistency check triggering on the very first hook tick.
             let _ = fs::remove_file(&responded_flag);
@@ -192,22 +193,45 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
             let existing = match fs::read(&dead_letter_path) {
                 Ok(b) => b,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
-                Err(e) => return Err(e),
+                Err(e) => {
+                    return Err(HeartbeatError::DeadLetterWrite {
+                        path: dead_letter_path.clone(),
+                        source: e,
+                    })
+                }
             };
 
             // Write existing + new record to .tmp, then rename atomically.
             {
-                let mut f = fs::File::create(&dead_letter_tmp)?;
-                f.write_all(&existing)?;
-                f.write_all(new_line.as_bytes())?;
-                f.sync_all()?;
+                let mut f =
+                    fs::File::create(&dead_letter_tmp).map_err(|e| HeartbeatError::DeadLetterWrite {
+                        path: dead_letter_path.clone(),
+                        source: e,
+                    })?;
+                f.write_all(&existing).map_err(|e| HeartbeatError::DeadLetterWrite {
+                    path: dead_letter_path.clone(),
+                    source: e,
+                })?;
+                f.write_all(new_line.as_bytes()).map_err(|e| HeartbeatError::DeadLetterWrite {
+                    path: dead_letter_path.clone(),
+                    source: e,
+                })?;
+                f.sync_all().map_err(|e| HeartbeatError::DeadLetterWrite {
+                    path: dead_letter_path.clone(),
+                    source: e,
+                })?;
             }
-            fs::rename(&dead_letter_tmp, &dead_letter_path)?;
+            fs::rename(&dead_letter_tmp, &dead_letter_path).map_err(|e| {
+                HeartbeatError::DeadLetterWrite {
+                    path: dead_letter_path.clone(),
+                    source: e,
+                }
+            })?;
 
             // Advance cursor past the orphaned entry.
             inbox::write_offset(&offset_file, entry.end_offset)?;
             // Remove .in-flight.
-            fs::remove_file(&in_flight_path)?;
+            let _ = fs::remove_file(&in_flight_path);
             // Remove .responded so the next session starts clean.
             let _ = fs::remove_file(&responded_flag);
             Ok(RecoveryOutcome::DeadLettered {
@@ -218,7 +242,7 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
         OrphanPolicy::Drop => {
             // Advance cursor past the entry, delete .in-flight. Accept the loss.
             inbox::write_offset(&offset_file, entry.end_offset)?;
-            fs::remove_file(&in_flight_path)?;
+            let _ = fs::remove_file(&in_flight_path);
             // Remove .responded so the next session starts clean.
             let _ = fs::remove_file(&responded_flag);
             Ok(RecoveryOutcome::Dropped {
@@ -231,6 +255,7 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> io::Result<RecoveryOu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::HeartbeatError;
     use crate::hook;
     use crate::in_flight::InFlightEntry;
     use crate::inbox;
@@ -338,7 +363,7 @@ mod tests {
         assert!(!in_flight_path.exists());
 
         // Cursor reset to start_offset of entry K (which is 0).
-        let cur = inbox::read_offset(&offset_file).unwrap();
+        let cur = inbox::read_offset(&offset_file).unwrap().unwrap_or(0);
         assert_eq!(cur, 0, "cursor must be reset to start_offset of orphan");
 
         // CRITICAL: inbox contents must be identical to before recovery.
@@ -424,7 +449,7 @@ mod tests {
         assert_eq!(parsed["raw_line"], "entry K");
 
         // Cursor advanced past entry.
-        let cur = inbox::read_offset(&offset_file).unwrap();
+        let cur = inbox::read_offset(&offset_file).unwrap().unwrap_or(0);
         assert!(cur > 0, "cursor must advance after dead-letter");
     }
 
@@ -439,7 +464,7 @@ mod tests {
             // Create a fresh inbox for each orphan — wipe all state including
             // .responded so the next hook::run starts from a clean slate.
             let _ = fs::remove_file(&inbox);
-            let _ = fs::remove_file(&dir.path().join(".responded"));
+            let _ = fs::remove_file(dir.path().join(".responded"));
             inbox::write_offset(&dir.path().join(".inbox-offset"), 0).unwrap();
             write_line(&inbox, entry_text);
             hook::run(&inbox, &hook::Mode::Drain).unwrap();
@@ -475,7 +500,7 @@ mod tests {
         }
 
         assert!(!in_flight_path.exists());
-        let cur = inbox::read_offset(&offset_file).unwrap();
+        let cur = inbox::read_offset(&offset_file).unwrap().unwrap_or(0);
         assert!(cur > 0);
     }
 
@@ -533,6 +558,8 @@ mod tests {
     // F23: corrupt .in-flight must propagate error (not return NothingToRecover)
     // -------------------------------------------------------------------------
 
+    /// Test 6 (§9.6): existing recover_errors_on_corrupt_in_flight now returns
+    /// the typed variant Err(HeartbeatError::InFlightCorrupt).
     #[test]
     fn recover_errors_on_corrupt_in_flight() {
         let dir = TempDir::new().unwrap();
@@ -543,10 +570,55 @@ mod tests {
         fs::write(&in_flight_path, "{not valid json").unwrap();
 
         let result = recover(&inbox, OrphanPolicy::DeadLetter);
-        assert!(
-            result.is_err(),
-            "recover must propagate error on corrupt .in-flight"
-        );
+        match result {
+            Err(HeartbeatError::InFlightCorrupt { path, source: _ }) => {
+                assert_eq!(
+                    path, in_flight_path,
+                    "InFlightCorrupt path must be the .in-flight file path"
+                );
+            }
+            other => panic!(
+                "expected Err(HeartbeatError::InFlightCorrupt), got {:?}",
+                other
+            ),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // NEW: error-path tests for typed HeartbeatError variants (lil-grabby §9)
+    // -------------------------------------------------------------------------
+
+    /// Test 5 (§9.5): corrupt offset file → recover →
+    /// Err(HeartbeatError::OffsetCorrupt { path, content }) with correct fields.
+    ///
+    /// Setup: .in-flight exists (so recover gets past the NothingToRecover check),
+    /// but the offset file contains garbage.
+    #[test]
+    fn corrupt_offset_recover_returns_offset_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+        let in_flight_path = in_flight(&dir);
+        let offset_file = dir.path().join(".inbox-offset");
+
+        // Write inbox and a valid .in-flight so recover reaches the read_offset call.
+        write_line(&inbox, "entry K");
+        let entry = InFlightEntry::new("entry K", 0, 8);
+        entry.write_to(&in_flight_path).unwrap();
+
+        // Write a corrupt offset file.
+        fs::write(&offset_file, "CORRUPT").unwrap();
+
+        let result = recover(&inbox, OrphanPolicy::DeadLetter);
+        match result {
+            Err(HeartbeatError::OffsetCorrupt { path, content }) => {
+                assert_eq!(path, offset_file, "path must be the offset file path");
+                assert_eq!(
+                    content, "CORRUPT",
+                    "content must be the trimmed string that failed to parse"
+                );
+            }
+            other => panic!("expected Err(HeartbeatError::OffsetCorrupt), got {:?}", other),
+        }
     }
 
     // -------------------------------------------------------------------------
