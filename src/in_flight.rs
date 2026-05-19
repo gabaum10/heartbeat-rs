@@ -69,34 +69,22 @@ impl InFlightEntry {
     /// Write this entry to `path` atomically (tmp + fsync + rename).
     pub fn write_to(&self, path: &Path) -> Result<()> {
         let tmp = path.with_extension("tmp");
-        let map_err = |e| HeartbeatError::InFlightWrite {
+        let write_err = |e: io::Error| HeartbeatError::InFlightWrite {
             path: path.to_owned(),
             source: e,
         };
         {
-            let mut f = fs::File::create(&tmp).map_err(map_err)?;
+            let mut f = fs::File::create(&tmp).map_err(write_err)?;
             // serde_json::to_string only fails on non-serializable types; our
             // struct derives Serialize so this is infallible in practice.
             // Map it to an IO error anyway for the rare edge case.
             let json = serde_json::to_string(self)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-                .map_err(|e| HeartbeatError::InFlightWrite {
-                    path: path.to_owned(),
-                    source: e,
-                })?;
-            f.write_all(json.as_bytes()).map_err(|e| HeartbeatError::InFlightWrite {
-                path: path.to_owned(),
-                source: e,
-            })?;
-            f.sync_all().map_err(|e| HeartbeatError::InFlightWrite {
-                path: path.to_owned(),
-                source: e,
-            })?;
+                .map_err(write_err)?;
+            f.write_all(json.as_bytes()).map_err(write_err)?;
+            f.sync_all().map_err(write_err)?;
         }
-        fs::rename(&tmp, path).map_err(|e| HeartbeatError::InFlightWrite {
-            path: path.to_owned(),
-            source: e,
-        })?;
+        fs::rename(&tmp, path).map_err(write_err)?;
         Ok(())
     }
 

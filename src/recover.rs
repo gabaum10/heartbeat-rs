@@ -189,44 +189,26 @@ pub fn recover(inbox_path: &Path, policy: OrphanPolicy) -> Result<RecoveryOutcom
             });
             let new_line = format!("{}\n", record);
 
+            let dl_err = |e: io::Error| HeartbeatError::DeadLetterWrite {
+                path: dead_letter_path.clone(),
+                source: e,
+            };
+
             // Read existing contents (may not exist yet).
             let existing = match fs::read(&dead_letter_path) {
                 Ok(b) => b,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
-                Err(e) => {
-                    return Err(HeartbeatError::DeadLetterWrite {
-                        path: dead_letter_path.clone(),
-                        source: e,
-                    })
-                }
+                Err(e) => return Err(dl_err(e)),
             };
 
             // Write existing + new record to .tmp, then rename atomically.
             {
-                let mut f =
-                    fs::File::create(&dead_letter_tmp).map_err(|e| HeartbeatError::DeadLetterWrite {
-                        path: dead_letter_path.clone(),
-                        source: e,
-                    })?;
-                f.write_all(&existing).map_err(|e| HeartbeatError::DeadLetterWrite {
-                    path: dead_letter_path.clone(),
-                    source: e,
-                })?;
-                f.write_all(new_line.as_bytes()).map_err(|e| HeartbeatError::DeadLetterWrite {
-                    path: dead_letter_path.clone(),
-                    source: e,
-                })?;
-                f.sync_all().map_err(|e| HeartbeatError::DeadLetterWrite {
-                    path: dead_letter_path.clone(),
-                    source: e,
-                })?;
+                let mut f = fs::File::create(&dead_letter_tmp).map_err(dl_err)?;
+                f.write_all(&existing).map_err(dl_err)?;
+                f.write_all(new_line.as_bytes()).map_err(dl_err)?;
+                f.sync_all().map_err(dl_err)?;
             }
-            fs::rename(&dead_letter_tmp, &dead_letter_path).map_err(|e| {
-                HeartbeatError::DeadLetterWrite {
-                    path: dead_letter_path.clone(),
-                    source: e,
-                }
-            })?;
+            fs::rename(&dead_letter_tmp, &dead_letter_path).map_err(dl_err)?;
 
             // Advance cursor past the orphaned entry.
             inbox::write_offset(&offset_file, entry.end_offset)?;

@@ -214,25 +214,16 @@ pub fn read_offset(offset_file: &Path) -> Result<Option<u64>> {
 /// tmp file) — actionable at 3am.
 pub fn write_offset(offset_file: &Path, offset: u64) -> Result<()> {
     let tmp = offset_file.with_extension("tmp");
-    let map_err = |e: io::Error| HeartbeatError::OffsetWrite {
+    let write_err = |e: io::Error| HeartbeatError::OffsetWrite {
         path: offset_file.to_owned(),
         source: e,
     };
     {
-        let mut f = fs::File::create(&tmp).map_err(map_err)?;
-        write!(f, "{}", offset).map_err(|e| HeartbeatError::OffsetWrite {
-            path: offset_file.to_owned(),
-            source: e,
-        })?;
-        f.sync_all().map_err(|e| HeartbeatError::OffsetWrite {
-            path: offset_file.to_owned(),
-            source: e,
-        })?;
+        let mut f = fs::File::create(&tmp).map_err(write_err)?;
+        write!(f, "{}", offset).map_err(write_err)?;
+        f.sync_all().map_err(write_err)?;
     }
-    fs::rename(&tmp, offset_file).map_err(|e| HeartbeatError::OffsetWrite {
-        path: offset_file.to_owned(),
-        source: e,
-    })?;
+    fs::rename(&tmp, offset_file).map_err(write_err)?;
     Ok(())
 }
 
