@@ -55,6 +55,7 @@ This enables the `cargo fmt` pre-commit check. Run `cargo fmt` before committing
 # Stop hook (call from .claude/settings.json)
 heartbeat-stop --inbox /path/to/inbox.jsonl --mode drain
 heartbeat-stop --inbox /path/to/inbox.jsonl --mode persist
+heartbeat-stop --inbox /path/to/inbox.jsonl --mode persist --idle-interval 300
 
 # Orphan recovery (call from your launcher before resetting the inbox)
 heartbeat-stop recover --inbox /path/to/inbox.jsonl --on-orphan deadletter
@@ -68,6 +69,16 @@ heartbeat-stop recover --inbox /path/to/inbox.jsonl --on-orphan drop
 |------|----------|
 | `drain` | Approves stop when the inbox is empty. The agent processes all queued messages, then exits. Use for timer-triggered dispatch, batch processing, or single-event sessions. |
 | `persist` | Sends idle ticks when the inbox is empty, keeping the session alive indefinitely. Use for long-running supervisor patterns where new messages may arrive at any time. |
+
+## Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--inbox <path>` | required | Path to the JSONL inbox file. |
+| `--mode <mode>` | `drain` | Operating mode: `drain` or `persist`. |
+| `--idle-interval <seconds>` | `2` | Seconds to sleep between consecutive idle ticks in `persist` mode. Only applies when the inbox is empty. The first inbox check is always immediate; this delay governs the gap between idle ticks. Set higher (e.g. `300`) for consumers where the inbox is populated infrequently. |
+
+**Important:** `--idle-interval` causes the hook process to sleep inside the hook invocation. Ensure your `"timeout"` value in `.claude/settings.json` is greater than `--idle-interval`, or Claude Code will kill the hook before the sleep completes. For a 300-second interval, set `"timeout": 310` or higher. Messages arriving during the sleep wait until the next hook invocation.
 
 ## Configuration
 
@@ -83,6 +94,26 @@ In the agent workspace `.claude/settings.json`:
             "type": "command",
             "command": "heartbeat-stop --inbox /path/to/agent/inbox.jsonl --mode drain",
             "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+For a persistent supervisor with a 5-minute idle interval:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "heartbeat-stop --inbox /path/to/agent/inbox.jsonl --mode persist --idle-interval 300",
+            "timeout": 310
           }
         ]
       }

@@ -38,6 +38,13 @@ struct Args {
     /// persist: send idle ticks when empty (session stays alive).
     #[arg(long, default_value = "drain")]
     mode: CliMode,
+
+    /// Seconds to sleep between idle ticks in persist mode. 0 disables sleeping
+    /// (useful for testing). Default: 2.
+    /// Note: ensure your hook `timeout` in .claude/settings.json is larger than
+    /// this value, or Claude Code will kill the hook before the sleep completes.
+    #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64))]
+    idle_interval: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -141,7 +148,13 @@ fn main() {
             };
 
             let mode = hook::Mode::from(args.mode);
-            let decision = match hook::run(&inbox, &mode) {
+            if args.idle_interval > 0 {
+                eprintln!(
+                    "heartbeat-stop: idle sleep {}s — ensure hook timeout > {}s",
+                    args.idle_interval, args.idle_interval
+                );
+            }
+            let decision = match hook::run(&inbox, &mode, args.idle_interval) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("heartbeat-stop: error: {e}");

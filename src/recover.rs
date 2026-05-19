@@ -328,7 +328,7 @@ mod tests {
         let inbox_before = fs::read_to_string(&inbox).unwrap();
 
         // Simulate first delivery via hook::run.
-        hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         // Cursor still at 0 (Fix B). .in-flight written.
         assert!(in_flight_path.exists());
 
@@ -374,7 +374,7 @@ mod tests {
 
         for cycle in 1..=5 {
             // Deliver (writes .in-flight, cursor stays at 0).
-            hook::run(&inbox, &hook::Mode::Drain).unwrap();
+            hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
             assert!(
                 in_flight_path.exists(),
                 "cycle {}: .in-flight must exist after delivery",
@@ -410,7 +410,7 @@ mod tests {
 
         write_line(&inbox, "entry K");
 
-        hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         assert!(in_flight_path.exists());
 
         let outcome = recover(&inbox, OrphanPolicy::DeadLetter).unwrap();
@@ -449,7 +449,7 @@ mod tests {
             let _ = fs::remove_file(dir.path().join(".responded"));
             inbox::write_offset(&dir.path().join(".inbox-offset"), 0).unwrap();
             write_line(&inbox, entry_text);
-            hook::run(&inbox, &hook::Mode::Drain).unwrap();
+            hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
             recover(&inbox, OrphanPolicy::DeadLetter).unwrap();
         }
 
@@ -470,7 +470,7 @@ mod tests {
         let in_flight_path = in_flight(&dir);
 
         write_line(&inbox, "entry K");
-        hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         assert!(in_flight_path.exists());
 
         let outcome = recover(&inbox, OrphanPolicy::Drop).unwrap();
@@ -500,8 +500,8 @@ mod tests {
         write_line(&inbox, "fen triage batch");
 
         // Full tick cycle: deliver + ack (session ends cleanly).
-        hook::run(&inbox, &hook::Mode::Drain).unwrap(); // deliver
-        hook::run(&inbox, &hook::Mode::Drain).unwrap(); // ack + approve
+        hook::run(&inbox, &hook::Mode::Drain, 0).unwrap(); // deliver
+        hook::run(&inbox, &hook::Mode::Drain, 0).unwrap(); // ack + approve
 
         // .in-flight should be gone after clean session.
         assert!(!in_flight(&dir).exists());
@@ -522,7 +522,7 @@ mod tests {
         write_line(&inbox, "fen triage batch");
 
         // Deliver only — simulate agent crash before ack.
-        hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         assert!(in_flight_path.exists());
 
         // Fen's launcher calls recover with drop.
@@ -622,7 +622,7 @@ mod tests {
         write_line(&inbox, "entry K+1");
 
         // Tick 1: deliver K. Writes .in-flight + .responded.
-        let d1 = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        let d1 = hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         assert_eq!(d1, hook::Decision::Block("entry K".to_string()));
         assert!(in_flight_path.exists());
 
@@ -642,7 +642,7 @@ mod tests {
 
         // Next hook::run (new session, clean state) must re-deliver K.
         // No manual .responded cleanup needed — recover handled it.
-        let d2 = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        let d2 = hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         assert_eq!(
             d2,
             hook::Decision::Block("entry K".to_string()),
@@ -650,7 +650,7 @@ mod tests {
         );
 
         // After ack (second tick), K+1 should come next.
-        let d3 = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        let d3 = hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         assert_eq!(d3, hook::Decision::Block("entry K+1".to_string()));
     }
 
@@ -679,7 +679,7 @@ mod tests {
 
         // --- Cycle N: write a batch, deliver, crash (no ack) ---
         write_line(&inbox, "cycle N email batch");
-        hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
 
         // After delivery: .in-flight and .responded both present, cursor at 0.
         assert!(in_flight_path.exists(), "cycle N: .in-flight must exist");
@@ -708,7 +708,7 @@ mod tests {
 
         // Step 3: new claude session starts. First Stop hook fires (turn 0).
         // Must deliver the new batch, NOT trigger F12.
-        let decision = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        let decision = hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         assert_eq!(
             decision,
             hook::Decision::Block("cycle N+1 email batch".to_string()),
@@ -742,7 +742,7 @@ mod tests {
         write_line(&inbox, "entry K+1");
 
         // Deliver entry K.
-        hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         assert!(in_flight_path.exists());
         assert!(responded_path.exists());
 
@@ -782,7 +782,7 @@ mod tests {
         );
 
         // Next hook tick must deliver entry K+1 cleanly, not error.
-        let decision = hook::run(&inbox, &hook::Mode::Drain).unwrap();
+        let decision = hook::run(&inbox, &hook::Mode::Drain, 0).unwrap();
         assert_eq!(
             decision,
             hook::Decision::Block("entry K+1".to_string()),
