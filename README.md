@@ -78,7 +78,7 @@ heartbeat-stop recover --inbox /path/to/inbox.jsonl --on-orphan drop
 | `--mode <mode>` | `drain` | Operating mode: `drain` or `persist`. |
 | `--idle-interval <seconds>` | `2` | Seconds to sleep between consecutive idle ticks in `persist` mode. Only applies when the inbox is empty. The first inbox check is always immediate; this delay governs the gap between idle ticks. Set higher (e.g. `300`) for consumers where the inbox is populated infrequently. |
 
-**Important:** `--idle-interval` causes the hook process to sleep inside the hook invocation. Ensure your `"timeout"` value in `.claude/settings.json` is greater than `--idle-interval`, or Claude Code will kill the hook before the sleep completes. For a 300-second interval, set `"timeout": 310` or higher.
+**Important:** `--idle-interval` causes the hook process to sleep inside the hook invocation. Ensure your `"timeout"` value in `.claude/settings.json` is greater than `--idle-interval`, or Claude Code will kill the hook before the sleep completes. For a 300-second interval, set `"timeout": 310` or higher. Messages arriving during the sleep wait until the next hook invocation.
 
 ## Configuration
 

@@ -39,11 +39,8 @@ struct Args {
     #[arg(long, default_value = "drain")]
     mode: CliMode,
 
-    /// Seconds to sleep between consecutive idle ticks in persist mode.
-    /// Only applies when the inbox is empty and no real message is pending.
-    /// Default is 2. Set higher (e.g. 300) for long-polling consumers where
-    /// frequent idle ticks are wasteful. Must be a positive integer; 0 disables
-    /// sleeping (useful for testing).
+    /// Seconds to sleep between idle ticks in persist mode. 0 disables sleeping
+    /// (useful for testing). Default: 2.
     /// Note: ensure your hook `timeout` in .claude/settings.json is larger than
     /// this value, or Claude Code will kill the hook before the sleep completes.
     #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64))]
@@ -151,6 +148,12 @@ fn main() {
             };
 
             let mode = hook::Mode::from(args.mode);
+            if args.idle_interval > 0 {
+                eprintln!(
+                    "heartbeat-stop: idle sleep {}s — ensure hook timeout > {}s",
+                    args.idle_interval, args.idle_interval
+                );
+            }
             let decision = match hook::run(&inbox, &mode, args.idle_interval) {
                 Ok(d) => d,
                 Err(e) => {
