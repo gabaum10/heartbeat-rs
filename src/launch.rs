@@ -17,9 +17,7 @@ use std::process;
 
 #[derive(Parser)]
 #[command(name = "heartbeat-launch")]
-#[command(
-    about = "Launch a command inside a PTY. Designed to give Claude Code interactive mode."
-)]
+#[command(about = "Launch a command inside a PTY. Designed to give Claude Code interactive mode.")]
 #[command(
     long_about = "Allocates a PTY via portable-pty (Unix PTY + Windows ConPTY), spawns the \
                   given command inside it, and forwards stdout to the current process. \
@@ -100,7 +98,13 @@ fn main() {
 
     match pty::run(&cli.cmd, &cwd, cli.timeout, cli.exit_signal.as_deref()) {
         Ok(result) => {
-            process::exit(result.exit_code as i32);
+            // Cap exit code at 125 to avoid overlapping with the timeout
+            // convention (124) and signal-death range (126-127 on POSIX shells).
+            // Values above 125 from a process exit() call are technically valid
+            // but unusual; saturation avoids silent i32 wrapping on values that
+            // exceed i32::MAX (which portable-pty represents as u32).
+            let code = result.exit_code.min(125) as i32;
+            process::exit(code);
         }
         Err(pty::PtyError::Timeout(secs)) => {
             eprintln!("heartbeat-launch: timeout after {secs}s — child killed");

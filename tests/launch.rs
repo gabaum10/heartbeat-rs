@@ -23,6 +23,7 @@ fn binary() -> PathBuf {
 // (a) echo hello: output contains "hello", exit code 0
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn echo_hello_output_and_exit_zero() {
     let out = Command::new(binary())
@@ -51,6 +52,7 @@ fn echo_hello_output_and_exit_zero() {
 // (b) `false` exits non-zero; heartbeat-launch forwards the exit code
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn exit_code_forwarded() {
     let out = Command::new(binary())
@@ -72,6 +74,7 @@ fn exit_code_forwarded() {
 // (c) --cwd sets working directory; `pwd` output matches
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn cwd_flag_sets_working_directory() {
     let tmp = std::env::temp_dir();
@@ -101,6 +104,7 @@ fn cwd_flag_sets_working_directory() {
 // (d) timeout fires: exit code 124
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn timeout_exits_124() {
     let out = Command::new(binary())
@@ -141,6 +145,7 @@ fn missing_command_exits_nonzero() {
 // (f) --timeout 0 means no timeout: a fast command completes normally
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn timeout_zero_means_no_timeout() {
     // echo exits immediately; with --timeout 0 (no timeout) it should succeed.
@@ -170,6 +175,7 @@ fn timeout_zero_means_no_timeout() {
 // (g) PTY contract: child sees a real TTY on stdout (isTTY = true)
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn tty_is_allocated() {
     let out = Command::new(binary())

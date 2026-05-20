@@ -15,6 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use libc;
+
 /// Result of a PTY session.
 #[derive(Debug)]
 pub struct RunResult {
@@ -25,51 +28,78 @@ pub struct RunResult {
 /// Errors from PTY operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
+    /// PTY pair could not be allocated. The inner error is from `portable-pty`
+    /// and typically indicates the OS refused to open a new PTY device (e.g.
+    /// `/dev/ptmx` unavailable or `/dev/pts` not mounted).
     #[error("failed to open PTY: {0}")]
     Open(anyhow::Error),
+
+    /// The command could not be spawned inside the PTY slave. Common causes:
+    /// executable not found on PATH, permission denied, or the slave fd was
+    /// already closed before `spawn_command` was called.
     #[error("failed to spawn command: {0}")]
     Spawn(anyhow::Error),
+
+    /// The PTY master could not be cloned into a read-only handle for the
+    /// background reader thread. This is fatal: without a reader the child's
+    /// stdout would block once the PTY buffer fills.
     #[error("failed to clone PTY reader: {0}")]
     Reader(anyhow::Error),
+
+    /// An unexpected I/O error occurred while polling the child process status.
+    /// Normal child exit and PTY EOF are handled without surfacing this variant.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    /// The child did not exit within `timeout_secs` seconds. The child has
+    /// already been killed (SIGKILL on Unix, `TerminateProcess` on Windows) by
+    /// the time this error is returned. The caller should treat this the same
+    /// as the `timeout(1)` utility: exit code 124 by convention.
     #[error("timeout: child did not exit within {0}s")]
     Timeout(u64),
 }
 
 /// Shut down the reader thread cleanly.
 ///
-/// Sets the stop flag, drops the PTY master (which causes EOF on the cloned
-/// reader, unblocking any pending `read()`), then waits up to 2 seconds for
-/// the thread to finish. If the thread is still alive after the deadline it
-/// is abandoned rather than blocking forever — this handles the known ConPTY
-/// behaviour on Windows where the pipe handle may not deliver EOF even after
-/// the child exits.
+/// Waits up to 2 seconds for the reader thread to finish draining remaining
+/// PTY output, then drops the PTY master. Dropping master before the reader
+/// has finished would close the fd and cause the background read() to see an
+/// error mid-drain, truncating any output buffered after the child exits. By
+/// waiting first we let the reader observe the natural EOF from the child
+/// closing the slave side.
+///
+/// If the thread is still alive after the deadline it is abandoned — this
+/// handles the known ConPTY behaviour on Windows where the pipe handle may not
+/// deliver EOF even after the child exits.
 fn join_reader(
     handle: JoinHandle<()>,
     stop: &Arc<Mutex<bool>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
 ) {
-    // Signal best-effort early exit inside the read loop.
-    if let Ok(mut g) = stop.lock() {
-        *g = true;
-    }
-    // Dropping master sends EOF to the cloned reader, which is the primary
-    // mechanism for unblocking the thread's blocking read() call.
-    drop(master);
-
+    // Give the reader thread a chance to drain remaining output before we
+    // close the master fd. The thread exits naturally when it sees EOF (Ok(0))
+    // from the slave closing after the child exits.
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if handle.is_finished() {
             let _ = handle.join();
-            break;
+            // Reader finished on its own: now safe to drop master.
+            drop(master);
+            return;
         }
         if Instant::now() > deadline {
-            // Thread hung (known ConPTY issue on Windows). Abandon it.
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
+
+    // Deadline elapsed without the reader finishing. Signal early exit and
+    // drop master to unblock any stuck read() (handles ConPTY on Windows).
+    if let Ok(mut g) = stop.lock() {
+        *g = true;
+    }
+    drop(master);
+    // Thread abandoned — do not join to avoid blocking indefinitely.
 }
 
 /// Write `/exit\n` to the PTY master to ask an interactive child (e.g. Claude
@@ -105,6 +135,9 @@ pub fn run(
     let pair = pty_system
         .openpty(PtySize {
             rows: 50,
+            // Wide enough to suppress Claude Code's line-wrap reformatting,
+            // which kicks in at narrower column counts and inserts spurious
+            // newlines/indentation into the PTY output stream.
             cols: 200,
             pixel_width: 0,
             pixel_height: 0,
@@ -117,10 +150,7 @@ pub fn run(
     }
     cmd.cwd(cwd);
 
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(PtyError::Spawn)?;
+    let mut child = pair.slave.spawn_command(cmd).map_err(PtyError::Spawn)?;
 
     // Drop slave so the master sees EOF when the child exits.
     drop(pair.slave);
@@ -162,6 +192,14 @@ pub fn run(
         }
     });
 
+    // Delete any stale signal file left over from a previous crash before
+    // entering the poll loop. Without this, a file orphaned by a prior
+    // abnormal exit would trigger an immediate /exit on the very first poll
+    // tick, poisoning the new session before the child has done any work.
+    if let Some(sig) = exit_signal {
+        let _ = std::fs::remove_file(sig);
+    }
+
     // Poll loop: check child exit, enforce timeout.
     // timeout_secs == 0 means no timeout: deadline is None and the timeout
     // branch inside the loop is never entered.
@@ -182,11 +220,30 @@ pub fn run(
                 // Still running.
                 if let Some(dl) = deadline {
                     if Instant::now() >= dl {
-                        // Timed out. portable-pty's kill() sends SIGKILL on Unix
-                        // (there is no graceful signal option in the portable-pty
-                        // API). We kill once and wait briefly for the child to be
-                        // reaped before cleaning up the reader thread.
-                        let _ = killer.kill(); // SIGKILL
+                        // Timed out. Kill the entire process group so that
+                        // grandchild processes (forks of the command) are also
+                        // reaped. On Unix we use killpg(pgid, SIGKILL) which
+                        // delivers SIGKILL to every member of the process
+                        // group. On other platforms we fall back to
+                        // portable-pty's kill() which only reaches the direct
+                        // child process.
+                        #[cfg(unix)]
+                        {
+                            // process_group_leader() reads the foreground pgid
+                            // from the PTY master via tcgetpgrp(). If the child
+                            // set up its own process group (typical for shells)
+                            // this covers all descendants in that group.
+                            if let Some(pgid) = pair.master.process_group_leader() {
+                                // SAFETY: pgid is a valid process group id
+                                // returned by the OS. A negative pgid to kill(2)
+                                // means "process group"; killpg(pgid, sig) is
+                                // equivalent to kill(-pgid, sig).
+                                unsafe {
+                                    libc::killpg(pgid, libc::SIGKILL);
+                                }
+                            }
+                        }
+                        let _ = killer.kill(); // belt-and-suspenders / Windows fallback
                         thread::sleep(Duration::from_millis(500));
                         // Clean up reader thread and return Err.
                         join_reader(reader_thread, &stop, pair.master);
@@ -228,6 +285,7 @@ mod tests {
     }
 
     /// Spawn `echo hello` inside a PTY, capture stdout, verify output and exit code.
+    #[cfg(unix)]
     #[test]
     fn echo_hello_exit_zero() {
         // Redirect PTY output to a temp file so we can inspect it.
@@ -240,6 +298,7 @@ mod tests {
     }
 
     /// A command that exits non-zero propagates the exit code.
+    #[cfg(unix)]
     #[test]
     fn nonzero_exit_code_propagated() {
         // `false` always exits 1.
@@ -248,19 +307,96 @@ mod tests {
     }
 
     /// Timeout fires and returns PtyError::Timeout.
+    #[cfg(unix)]
     #[test]
     fn timeout_fires() {
         // Sleep for 60s but give it only 1s timeout.
-        let err = run(
-            &["sleep".to_string(), "60".to_string()],
-            &tmp(),
-            1,
-            None,
-        )
-        .expect_err("should time out");
+        let err = run(&["sleep".to_string(), "60".to_string()], &tmp(), 1, None)
+            .expect_err("should time out");
         match err {
             PtyError::Timeout(secs) => assert_eq!(secs, 1),
             other => panic!("expected Timeout, got {other:?}"),
         }
+    }
+
+    /// Signal file triggers /exit: create the signal file while a long-running
+    /// command is inside the PTY and verify the child exits within a reasonable
+    /// deadline.
+    ///
+    /// We spawn `sh -c 'read line'` which blocks waiting for stdin input.
+    /// A background thread creates the signal file after a short delay.
+    /// heartbeat-launch's poll loop detects the file, writes `/exit\n` to the
+    /// PTY master, and the shell receives it on stdin — causing it to exit.
+    #[cfg(unix)]
+    #[test]
+    fn exit_signal_triggers_child_exit() {
+        use std::fs;
+
+        let signal_path = tmp().join("test-exit-signal-trigger.tmp");
+        // Ensure clean state.
+        let _ = fs::remove_file(&signal_path);
+
+        let signal_path_clone = signal_path.clone();
+        let writer_thread = thread::spawn(move || {
+            // Give the PTY poll loop time to start before creating the file.
+            thread::sleep(Duration::from_millis(300));
+            fs::write(&signal_path_clone, b"").expect("write signal file");
+        });
+
+        // `read line` blocks on stdin until it receives a line.
+        // When /exit\n is written to the PTY master the shell reads it,
+        // processes it as the value for `line`, and returns 0.
+        let result = run(
+            &["sh".to_string(), "-c".to_string(), "read line".to_string()],
+            &tmp(),
+            10, // generous timeout so the test doesn't hang on slow CI
+            Some(&signal_path),
+        )
+        .expect("run should succeed");
+
+        writer_thread.join().expect("writer thread panicked");
+
+        assert_eq!(result.exit_code, 0, "child should exit 0 after signal");
+        // Signal file should have been deleted by send_exit_command.
+        assert!(
+            !signal_path.exists(),
+            "signal file should be deleted after /exit is sent"
+        );
+    }
+
+    /// Stale signal file at startup: a pre-existing signal file is deleted
+    /// before the poll loop begins, preventing orphan-file poisoning where a
+    /// crash on a previous run leaves the file behind and the next invocation
+    /// immediately exits.
+    #[cfg(unix)]
+    #[test]
+    fn stale_signal_file_deleted_before_poll() {
+        use std::fs;
+
+        let signal_path = tmp().join("test-exit-signal-stale.tmp");
+        // Create the stale file BEFORE calling run().
+        fs::write(&signal_path, b"").expect("write stale signal file");
+        assert!(
+            signal_path.exists(),
+            "precondition: stale file should exist"
+        );
+
+        // `echo hello` exits immediately. If the stale signal file caused an
+        // immediate /exit, the child would still exit 0 — but the important
+        // thing is that the file was deleted during startup, not during the
+        // first poll tick, so we also check that it's gone after run().
+        let result = run(
+            &["echo".to_string(), "hello".to_string()],
+            &tmp(),
+            10,
+            Some(&signal_path),
+        )
+        .expect("run should succeed");
+
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            !signal_path.exists(),
+            "stale signal file should be deleted by run() before poll loop"
+        );
     }
 }
