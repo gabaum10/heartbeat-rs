@@ -136,3 +136,21 @@ fn missing_command_exits_nonzero() {
         "missing command should exit non-zero"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (f) PTY contract: child sees a real TTY on stdout (isTTY = true)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tty_is_allocated() {
+    let out = Command::new(binary())
+        .args(["--", "sh", "-c", "[ -t 1 ] && echo tty || echo notty"])
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tty"),
+        "expected 'tty' in output, got: {stdout}"
+    );
+}

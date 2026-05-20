@@ -12,7 +12,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Result of a PTY session.
@@ -20,8 +20,6 @@ use std::time::{Duration, Instant};
 pub struct RunResult {
     /// Exit code from the child process.
     pub exit_code: u32,
-    /// Whether the session timed out before the child exited.
-    pub timed_out: bool,
 }
 
 /// Errors from PTY operations.
@@ -37,6 +35,41 @@ pub enum PtyError {
     Io(#[from] io::Error),
     #[error("timeout: child did not exit within {0}s")]
     Timeout(u64),
+}
+
+/// Shut down the reader thread cleanly.
+///
+/// Sets the stop flag, drops the PTY master (which causes EOF on the cloned
+/// reader, unblocking any pending `read()`), then waits up to 2 seconds for
+/// the thread to finish. If the thread is still alive after the deadline it
+/// is abandoned rather than blocking forever — this handles the known ConPTY
+/// behaviour on Windows where the pipe handle may not deliver EOF even after
+/// the child exits.
+fn join_reader(
+    handle: JoinHandle<()>,
+    stop: &Arc<Mutex<bool>>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+) {
+    // Signal best-effort early exit inside the read loop.
+    if let Ok(mut g) = stop.lock() {
+        *g = true;
+    }
+    // Dropping master sends EOF to the cloned reader, which is the primary
+    // mechanism for unblocking the thread's blocking read() call.
+    drop(master);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if handle.is_finished() {
+            let _ = handle.join();
+            break;
+        }
+        if Instant::now() > deadline {
+            // Thread hung (known ConPTY issue on Windows). Abandon it.
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Allocate a PTY, spawn `argv` inside it, stream stdout to the current
@@ -85,10 +118,10 @@ pub fn run(argv: &[String], cwd: &Path, timeout_secs: u64) -> Result<RunResult, 
         let mut buf = [0u8; 4096];
         loop {
             // Check stop flag before blocking read.
-            {
-                if *stop_reader.lock().unwrap() {
-                    break;
-                }
+            // Real shutdown comes from drop(pair.master) causing EOF on the
+            // reader; this flag is a best-effort early exit on timeout.
+            if stop_reader.lock().map_or(false, |g| *g) {
+                break;
             }
             match reader.read(&mut buf) {
                 Ok(0) => break, // EOF: slave side closed
@@ -114,53 +147,38 @@ pub fn run(argv: &[String], cwd: &Path, timeout_secs: u64) -> Result<RunResult, 
         None
     };
 
-    let exit_code;
-    let timed_out;
-
-    loop {
+    let exit_code = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                exit_code = status.exit_code();
-                timed_out = false;
-                break;
-            }
+            Ok(Some(status)) => break status.exit_code(),
             Ok(None) => {
                 // Still running.
                 if let Some(dl) = deadline {
                     if Instant::now() >= dl {
-                        // Signal stop to reader thread, kill child.
-                        *stop.lock().unwrap() = true;
-                        let _ = killer.kill();
-                        // Give it a moment to die, then claim the exit code.
+                        // Timed out. Send SIGHUP via the cloned killer, wait briefly,
+                        // then escalate to a hard kill if the child is still alive.
+                        // Escalation matters on Unix when the child catches SIGHUP.
+                        let _ = killer.kill(); // SIGHUP
                         thread::sleep(Duration::from_millis(500));
-                        exit_code = match child.try_wait() {
-                            Ok(Some(s)) => s.exit_code(),
-                            _ => 1,
-                        };
-                        timed_out = true;
-                        break;
+                        if matches!(child.try_wait(), Ok(None)) {
+                            // Still alive after SIGHUP — force kill.
+                            let _ = child.kill();
+                            thread::sleep(Duration::from_millis(200));
+                        }
+                        // Clean up reader thread and return Err.
+                        join_reader(reader_thread, &stop, pair.master);
+                        return Err(PtyError::Timeout(timeout_secs));
                     }
                 }
                 thread::sleep(poll_interval);
             }
             Err(e) => return Err(PtyError::Io(e)),
         }
-    }
+    };
 
-    // Signal reader thread to finish and join.
-    *stop.lock().unwrap() = true;
-    // Drop master to unblock any pending read.
-    drop(pair.master);
-    let _ = reader_thread.join();
+    // Normal exit: shut down reader thread.
+    join_reader(reader_thread, &stop, pair.master);
 
-    if timed_out {
-        return Err(PtyError::Timeout(timeout_secs));
-    }
-
-    Ok(RunResult {
-        exit_code,
-        timed_out: false,
-    })
+    Ok(RunResult { exit_code })
 }
 
 #[cfg(test)]
@@ -182,7 +200,6 @@ mod tests {
         let result = run(&["echo".to_string(), "hello".to_string()], &tmp(), 10)
             .expect("run should succeed");
         assert_eq!(result.exit_code, 0, "echo should exit 0");
-        assert!(!result.timed_out);
     }
 
     /// A command that exits non-zero propagates the exit code.

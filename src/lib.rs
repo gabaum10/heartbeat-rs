@@ -9,5 +9,6 @@ pub use error::{HeartbeatError, Result};
 pub mod hook;
 pub mod in_flight;
 pub mod inbox;
+#[cfg(feature = "launch")]
 pub mod pty;
 pub mod recover;
