@@ -120,7 +120,7 @@ pub fn run(argv: &[String], cwd: &Path, timeout_secs: u64) -> Result<RunResult, 
             // Check stop flag before blocking read.
             // Real shutdown comes from drop(pair.master) causing EOF on the
             // reader; this flag is a best-effort early exit on timeout.
-            if stop_reader.lock().map_or(false, |g| *g) {
+            if stop_reader.lock().is_ok_and(|g| *g) {
                 break;
             }
             match reader.read(&mut buf) {
@@ -140,6 +140,8 @@ pub fn run(argv: &[String], cwd: &Path, timeout_secs: u64) -> Result<RunResult, 
     });
 
     // Poll loop: check child exit, enforce timeout.
+    // timeout_secs == 0 means no timeout: deadline is None and the timeout
+    // branch inside the loop is never entered.
     let poll_interval = Duration::from_millis(100);
     let deadline = if timeout_secs > 0 {
         Some(Instant::now() + Duration::from_secs(timeout_secs))
@@ -154,16 +156,12 @@ pub fn run(argv: &[String], cwd: &Path, timeout_secs: u64) -> Result<RunResult, 
                 // Still running.
                 if let Some(dl) = deadline {
                     if Instant::now() >= dl {
-                        // Timed out. Send SIGHUP via the cloned killer, wait briefly,
-                        // then escalate to a hard kill if the child is still alive.
-                        // Escalation matters on Unix when the child catches SIGHUP.
-                        let _ = killer.kill(); // SIGHUP
+                        // Timed out. portable-pty's kill() sends SIGKILL on Unix
+                        // (there is no graceful signal option in the portable-pty
+                        // API). We kill once and wait briefly for the child to be
+                        // reaped before cleaning up the reader thread.
+                        let _ = killer.kill(); // SIGKILL
                         thread::sleep(Duration::from_millis(500));
-                        if matches!(child.try_wait(), Ok(None)) {
-                            // Still alive after SIGHUP — force kill.
-                            let _ = child.kill();
-                            thread::sleep(Duration::from_millis(200));
-                        }
                         // Clean up reader thread and return Err.
                         join_reader(reader_thread, &stop, pair.master);
                         return Err(PtyError::Timeout(timeout_secs));

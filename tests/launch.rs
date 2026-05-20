@@ -138,7 +138,36 @@ fn missing_command_exits_nonzero() {
 }
 
 // ---------------------------------------------------------------------------
-// (f) PTY contract: child sees a real TTY on stdout (isTTY = true)
+// (f) --timeout 0 means no timeout: a fast command completes normally
+// ---------------------------------------------------------------------------
+
+#[test]
+fn timeout_zero_means_no_timeout() {
+    // echo exits immediately; with --timeout 0 (no timeout) it should succeed.
+    let out = Command::new(binary())
+        .arg("--timeout")
+        .arg("0")
+        .arg("--")
+        .arg("echo")
+        .arg("hello")
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--timeout 0 should not kill immediately; echo should exit 0, got: {:?}",
+        out.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("hello"),
+        "stdout should contain 'hello', got: {stdout:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (g) PTY contract: child sees a real TTY on stdout (isTTY = true)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -149,8 +178,11 @@ fn tty_is_allocated() {
         .expect("failed to run heartbeat-launch");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("tty"),
-        "expected 'tty' in output, got: {stdout}"
+    // Trim whitespace and ANSI sequences that PTY may append; check for exact
+    // "tty" rather than stdout.contains("tty"), which would also match "notty".
+    assert_eq!(
+        stdout.trim(),
+        "tty",
+        "expected stdout to be exactly 'tty' (child should see a TTY), got: {stdout:?}"
     );
 }

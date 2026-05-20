@@ -1,7 +1,8 @@
-//! heartbeat-rs: Stop hook implementation for autonomous Claude Code agent loops.
+//! heartbeat-rs: Stop hook and PTY launcher for autonomous Claude Code agent loops.
 //!
-//! This library provides the core primitives used by the `heartbeat-stop` binary,
-//! and the PTY spawn layer used by the `heartbeat-launch` binary.
+//! This library provides the core primitives used by the `heartbeat-stop` stop hook
+//! binary, and the PTY spawn layer used by the `heartbeat-launch` binary (feature-gated
+//! behind `--features launch`).
 
 pub mod error;
 pub use error::{HeartbeatError, Result};

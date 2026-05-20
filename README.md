@@ -29,7 +29,11 @@ Claude Code's `.claude/settings.json` supports a `Stop` hook. The hook's stdout 
 Once published to crates.io:
 
 ```bash
+# Install heartbeat-stop only (default, dependency-minimal)
 cargo install heartbeat-rs
+
+# Install both heartbeat-stop and heartbeat-launch (requires PTY support)
+cargo install heartbeat-rs --features launch
 ```
 
 Build from source:
@@ -37,8 +41,15 @@ Build from source:
 ```bash
 git clone https://github.com/gabaum10/heartbeat-rs
 cd heartbeat-rs
+
+# heartbeat-stop only
 cargo build --release
 cp target/release/heartbeat-stop ~/.local/bin/
+
+# heartbeat-stop + heartbeat-launch
+cargo build --release --features launch
+cp target/release/heartbeat-stop ~/.local/bin/
+cp target/release/heartbeat-launch ~/.local/bin/
 ```
 
 After cloning, activate the git hooks:
@@ -62,6 +73,30 @@ heartbeat-stop recover --inbox /path/to/inbox.jsonl --on-orphan deadletter
 heartbeat-stop recover --inbox /path/to/inbox.jsonl --on-orphan retry
 heartbeat-stop recover --inbox /path/to/inbox.jsonl --on-orphan drop
 ```
+
+### heartbeat-launch (requires `--features launch`)
+
+`heartbeat-launch` spawns an arbitrary command inside a PTY. Its primary use is ensuring Claude Code detects a real TTY and runs in interactive `cli` mode rather than `sdk-cli` mode.
+
+```bash
+# Basic: launch a command inside a PTY (1-hour default timeout)
+heartbeat-launch -- claude --model claude-opus-4-5 "Read CLAUDE.md"
+
+# With explicit working directory and timeout
+heartbeat-launch --cwd /path/to/agent/workspace --timeout 7200 -- claude "Read CLAUDE.md"
+
+# No timeout (run until the command exits)
+heartbeat-launch --timeout 0 -- claude "Read CLAUDE.md"
+```
+
+**`heartbeat-launch` is not a session manager.** It allocates a PTY, spawns the command, streams stdout, and exits when the command exits. Everything else -- inbox setup, `settings.json`, stop hook wiring, orphan recovery -- is the consumer's responsibility.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cwd <dir>` | `.` | Working directory for the child process. |
+| `--timeout <secs>` | `3600` | Seconds before the child is killed (SIGKILL). `0` means no timeout. |
+
+Exit codes mirror the child process. Timeout exits with code `124` (same convention as `timeout(1)` on Linux).
 
 ## Modes
 
@@ -147,7 +182,7 @@ The hook detects the leading `"` and unwraps the JSON string before delivery, so
 ┌─────────────────────────┐
 │  LAUNCHER (your script) │  Polls for work, writes to inbox, starts claude
 └───────────┬─────────────┘
-            │ launches interactive session
+            │ optionally via heartbeat-launch (PTY wrapper)
 ┌───────────▼─────────────┐
 │  CLAUDE CODE SESSION    │  Reads CLAUDE.md, responds
 └───────────┬─────────────┘
@@ -156,6 +191,14 @@ The hook detects the leading `"` and unwraps the JSON string before delivery, so
 │  heartbeat-stop (hook)  │  Reads inbox, delivers or drains
 └─────────────────────────┘
 ```
+
+### PTY layer (`heartbeat-launch`)
+
+Claude Code checks whether its stdout is a TTY to decide whether to run in interactive `cli` mode (full UI, tool rendering) or headless `sdk-cli` mode. When launched from a script, there is no TTY and Claude defaults to `sdk-cli`. `heartbeat-launch` allocates a real PTY via `portable-pty` and spawns the child inside it, so Claude's `isTTY` check succeeds.
+
+The PTY layer is thin: it allocates the pair, spawns the command on the slave side, drops the slave so the master sees EOF on child exit, and runs a background thread to forward the master's output to the caller's stdout. The main thread polls for child exit in a 100ms loop and enforces the configurable timeout.
+
+`heartbeat-launch` is feature-gated (`--features launch`) to keep the default binary's dependency footprint minimal. Scripts that don't need TTY allocation can use `heartbeat-stop` directly with `claude --print` or in environments where a TTY is already present.
 
 **The launcher is load-bearing.** It's where you poll for new work (IMAP, ticket API, file watcher, CI webhook), format the prompt, write to the inbox, and start `claude`. Different use cases write different launchers. The hook binary is the same everywhere.
 
