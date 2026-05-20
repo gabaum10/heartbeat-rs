@@ -45,6 +45,18 @@ struct Args {
     /// this value, or Claude Code will kill the hook before the sleep completes.
     #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64))]
     idle_interval: u64,
+
+    /// Optional path to a signal file used for PTY exit coordination.
+    ///
+    /// When the hook decides Approve (session should end), it touches this
+    /// file before printing the empty approve output. heartbeat-launch polls
+    /// for the file and writes `/exit\n` to the PTY master when it appears,
+    /// allowing the child (e.g. Claude Code) to exit cleanly.
+    ///
+    /// Must match the `--exit-signal` value passed to heartbeat-launch.
+    /// If omitted, no signal-file coordination is performed.
+    #[arg(long)]
+    signal_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -162,6 +174,26 @@ fn main() {
                     hook::Decision::Approve
                 }
             };
+
+            // Signal-file coordination: when the decision is Approve, touch the
+            // signal file (if configured) so heartbeat-launch knows to send
+            // /exit\n to the PTY master. Must happen before we print the approve
+            // output so the launcher sees the file before Claude Code exits.
+            if matches!(decision, hook::Decision::Approve) {
+                if let Some(ref sig) = args.signal_file {
+                    if let Err(e) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .write(true)
+                        .open(sig)
+                    {
+                        eprintln!(
+                            "heartbeat-stop: warning: could not touch signal file {}: {e}",
+                            sig.display()
+                        );
+                    }
+                }
+            }
 
             let output = hook::serialize(&decision);
             if !output.is_empty() {
