@@ -358,6 +358,8 @@ heartbeat-stop recover --inbox "$INBOX" --on-orphan deadletter
 
 **IMPORTANT:** Each consumer must use its own `$AGENT_DIR`. Two launchers sharing the same inbox directory will corrupt each other's state. One directory, one consumer, full stop.
 
+**Signal file paths must be unique per session.** If you use `--exit-signal` or `--signal-file`, include the session directory in the path (e.g. `$AGENT_DIR/.exit-signal`) rather than a fixed path like `/tmp/heartbeat-stop`. Two sessions sharing a signal file path will interfere: one session's stop signal triggers the other's shutdown.
+
 ## Use Cases
 
 - **Timer-driven automation.** A cron job or systemd timer polls for work, queues prompts, and launches a session that processes them and exits.

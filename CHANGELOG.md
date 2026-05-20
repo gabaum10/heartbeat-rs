@@ -11,3 +11,5 @@ All notable changes to this project will be documented in this file.
 - **Feature gate: `launch`** — `heartbeat-launch` and its dependencies (`portable-pty`, `anyhow`) are compiled only when `--features launch` is passed. The default build (`heartbeat-stop` only) remains dependency-minimal.
 - **`--timeout` flag for `heartbeat-launch`** — seconds before the child is killed (SIGKILL). `0` means no timeout. Defaults to 3600s.
 - **`--cwd` flag for `heartbeat-launch`** — working directory for the child process. Defaults to `.`.
+- **`--exit-signal` flag for `heartbeat-launch`** — path to a signal file. When this file exists, `heartbeat-launch` sends SIGTERM to the child and removes the file, allowing external coordination of clean session shutdown.
+- **`--signal-file` flag for `heartbeat-stop`** — path to a signal file. The stop hook writes this file when it decides to approve the stop, letting launchers detect clean drain completion without polling.

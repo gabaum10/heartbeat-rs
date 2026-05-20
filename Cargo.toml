@@ -1,8 +1,8 @@
 [package]
 name = "heartbeat-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
-description = "Stop hook for autonomous Claude Code agent loops — drain a message inbox across turns without a persistent process"
+description = "Heartbeat pattern for persistent AI CLI sessions — stop hook (heartbeat-stop) and PTY launcher (heartbeat-launch)"
 license = "MIT"
 repository = "https://github.com/gabaum10/heartbeat-rs"
 authors = ["Geoff Baum <gabaum10@gmail.com>"]
