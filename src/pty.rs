@@ -8,7 +8,7 @@
 //!
 //! No inbox, no settings.json, no handshake. The consumer handles all of that.
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -72,11 +72,34 @@ fn join_reader(
     }
 }
 
+/// Write `/exit\n` to the PTY master to ask an interactive child (e.g. Claude
+/// Code) to exit cleanly, then delete the signal file.
+///
+/// Best-effort: errors are ignored so the caller continues polling for child
+/// exit regardless.
+fn send_exit_command(master: &dyn MasterPty, signal_path: &Path) {
+    if let Ok(mut writer) = master.take_writer() {
+        let _ = writer.write_all(b"/exit\n");
+        let _ = writer.flush();
+    }
+    let _ = std::fs::remove_file(signal_path);
+}
+
 /// Allocate a PTY, spawn `argv` inside it, stream stdout to the current
 /// process's stdout, and poll until the child exits or `timeout_secs` elapses.
 ///
 /// `timeout_secs == 0` means no timeout.
-pub fn run(argv: &[String], cwd: &Path, timeout_secs: u64) -> Result<RunResult, PtyError> {
+///
+/// `exit_signal` — optional path to a signal file. When the file appears
+/// during the poll loop (written by `heartbeat-stop` when it decides Approve),
+/// `/exit\n` is written to the PTY master and the file is deleted. The poll
+/// loop then continues waiting for the child to exit normally.
+pub fn run(
+    argv: &[String],
+    cwd: &Path,
+    timeout_secs: u64,
+    exit_signal: Option<&Path>,
+) -> Result<RunResult, PtyError> {
     let pty_system = native_pty_system();
 
     let pair = pty_system
@@ -149,6 +172,9 @@ pub fn run(argv: &[String], cwd: &Path, timeout_secs: u64) -> Result<RunResult, 
         None
     };
 
+    // Track whether we have already sent the exit command so we only do it once.
+    let mut exit_sent = false;
+
     let exit_code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.exit_code(),
@@ -167,6 +193,19 @@ pub fn run(argv: &[String], cwd: &Path, timeout_secs: u64) -> Result<RunResult, 
                         return Err(PtyError::Timeout(timeout_secs));
                     }
                 }
+
+                // Check exit signal file. When heartbeat-stop decides Approve
+                // it touches this file; we write /exit\n to the PTY master and
+                // delete the file so the child receives the exit command once.
+                if !exit_sent {
+                    if let Some(sig) = exit_signal {
+                        if sig.exists() {
+                            send_exit_command(pair.master.as_ref(), sig);
+                            exit_sent = true;
+                        }
+                    }
+                }
+
                 thread::sleep(poll_interval);
             }
             Err(e) => return Err(PtyError::Io(e)),
@@ -195,7 +234,7 @@ mod tests {
         // We can't easily capture stdout from within the same process in a
         // unit test, so we verify exit code here and test output capture in
         // the integration test.
-        let result = run(&["echo".to_string(), "hello".to_string()], &tmp(), 10)
+        let result = run(&["echo".to_string(), "hello".to_string()], &tmp(), 10, None)
             .expect("run should succeed");
         assert_eq!(result.exit_code, 0, "echo should exit 0");
     }
@@ -204,7 +243,7 @@ mod tests {
     #[test]
     fn nonzero_exit_code_propagated() {
         // `false` always exits 1.
-        let result = run(&["false".to_string()], &tmp(), 10).expect("run should succeed");
+        let result = run(&["false".to_string()], &tmp(), 10, None).expect("run should succeed");
         assert_ne!(result.exit_code, 0, "false should exit non-zero");
     }
 
@@ -216,6 +255,7 @@ mod tests {
             &["sleep".to_string(), "60".to_string()],
             &tmp(),
             1,
+            None,
         )
         .expect_err("should time out");
         match err {

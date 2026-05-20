@@ -37,6 +37,18 @@ struct Cli {
     #[arg(long, default_value = "3600")]
     timeout: u64,
 
+    /// Optional path to an exit signal file.
+    ///
+    /// When heartbeat-stop decides the session should end (Approve), it
+    /// touches this file. heartbeat-launch detects the file in its poll loop,
+    /// writes `/exit\n` to the PTY master, and deletes the file. The child
+    /// then receives the command and exits normally.
+    ///
+    /// Must match the `--signal-file` value passed to heartbeat-stop.
+    /// If omitted, no signal-file coordination is performed.
+    #[arg(long)]
+    exit_signal: Option<PathBuf>,
+
     /// Command and arguments to run inside the PTY.
     /// Pass everything after `--`.
     #[arg(trailing_var_arg = true, required = true)]
@@ -86,7 +98,7 @@ fn main() {
         );
     }
 
-    match pty::run(&cli.cmd, &cwd, cli.timeout) {
+    match pty::run(&cli.cmd, &cwd, cli.timeout, cli.exit_signal.as_deref()) {
         Ok(result) => {
             process::exit(result.exit_code as i32);
         }
