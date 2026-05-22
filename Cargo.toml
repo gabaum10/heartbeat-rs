@@ -1,6 +1,6 @@
 [package]
 name = "heartbeat-rs"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Heartbeat pattern for persistent AI CLI sessions — stop hook (heartbeat-stop) and PTY launcher (heartbeat-launch)"
 license = "MIT"
