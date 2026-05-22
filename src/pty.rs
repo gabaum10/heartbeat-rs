@@ -192,7 +192,12 @@ fn spawn_pty_child(argv: &[String], cwd: &Path) -> Result<PtySpawn, PtyError> {
     let reader = pair.master.try_clone_reader().map_err(PtyError::Reader)?;
     let master = pair.master;
 
-    Ok(PtySpawn { master, child, killer, reader })
+    Ok(PtySpawn {
+        master,
+        child,
+        killer,
+        reader,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +325,9 @@ impl IdleState {
     fn from_config(idle: Option<&IdleConfig>) -> Self {
         IdleState {
             timeout: idle.map(|c| c.timeout_secs).unwrap_or(0),
-            prompt: idle.map(|c| c.prompt.clone()).unwrap_or_else(|| "Continue".to_string()),
+            prompt: idle
+                .map(|c| c.prompt.clone())
+                .unwrap_or_else(|| "Continue".to_string()),
             max_retries: idle.map(|c| c.max_retries).unwrap_or(3),
             retry_count: 0,
             last_keepalive: None,
@@ -445,7 +452,12 @@ pub fn run(
     exit_signal: Option<&Path>,
     idle: Option<&IdleConfig>,
 ) -> Result<RunResult, PtyError> {
-    let PtySpawn { master, mut child, mut killer, reader } = spawn_pty_child(argv, cwd)?;
+    let PtySpawn {
+        master,
+        mut child,
+        mut killer,
+        reader,
+    } = spawn_pty_child(argv, cwd)?;
 
     // Shared flag: main thread signals reader thread to stop on timeout.
     let stop = Arc::new(Mutex::new(false));
@@ -454,11 +466,7 @@ pub fn run(
     // The poll loop reads it to detect idle periods.
     let last_output: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
-    let reader_thread = spawn_basic_reader(
-        reader,
-        Arc::clone(&stop),
-        Arc::clone(&last_output),
-    );
+    let reader_thread = spawn_basic_reader(reader, Arc::clone(&stop), Arc::clone(&last_output));
 
     // Delete any stale signal file left over from a previous crash before
     // entering the poll loop. Without this, a file orphaned by a prior
@@ -552,7 +560,9 @@ pub fn run(
                 // idle_timeout, inject ESC + keepalive prompt to unstick the
                 // stalled generation. After max_idle_retries injections without
                 // recovery, give up and kill the child.
-                if let IdleTick::Exhausted = tick_idle(&mut idle_state, &last_output, &mut pty_writer, false) {
+                if let IdleTick::Exhausted =
+                    tick_idle(&mut idle_state, &last_output, &mut pty_writer, false)
+                {
                     eprintln!(
                         "heartbeat-launch: idle timeout fired {} time(s) without recovery — killing child",
                         idle_state.retry_count
@@ -663,9 +673,17 @@ pub fn run_with_queue(
         .map(|l| l.to_string())
         .collect();
     let total = entries.len();
-    eprintln!("heartbeat-launch: queue mode — {total} entries from {}", queue.queue_path.display());
+    eprintln!(
+        "heartbeat-launch: queue mode — {total} entries from {}",
+        queue.queue_path.display()
+    );
 
-    let PtySpawn { master, mut child, mut killer, reader } = spawn_pty_child(argv, cwd)?;
+    let PtySpawn {
+        master,
+        mut child,
+        mut killer,
+        reader,
+    } = spawn_pty_child(argv, cwd)?;
 
     // Shared stop flag.
     let stop = Arc::new(Mutex::new(false));
@@ -727,7 +745,9 @@ pub fn run_with_queue(
                         #[cfg(unix)]
                         {
                             if let Some(pgid) = master.process_group_leader() {
-                                unsafe { libc::killpg(pgid, libc::SIGKILL); }
+                                unsafe {
+                                    libc::killpg(pgid, libc::SIGKILL);
+                                }
                             }
                         }
                         let _ = killer.kill();
@@ -756,7 +776,9 @@ pub fn run_with_queue(
                 // any work yet and we don't want spurious keepalive injections
                 // during the startup silence window.
                 let skip_idle = queue_state == QueueState::WaitingForBoot;
-                if let IdleTick::Exhausted = tick_idle(&mut idle_state, &last_output, &mut pty_writer, skip_idle) {
+                if let IdleTick::Exhausted =
+                    tick_idle(&mut idle_state, &last_output, &mut pty_writer, skip_idle)
+                {
                     eprintln!(
                         "heartbeat-launch: idle timeout fired {} time(s) without recovery — killing child",
                         idle_state.retry_count
@@ -764,7 +786,9 @@ pub fn run_with_queue(
                     #[cfg(unix)]
                     {
                         if let Some(pgid) = master.process_group_leader() {
-                            unsafe { libc::killpg(pgid, libc::SIGKILL); }
+                            unsafe {
+                                libc::killpg(pgid, libc::SIGKILL);
+                            }
                         }
                     }
                     let _ = killer.kill();
@@ -814,8 +838,7 @@ pub fn run_with_queue(
                             }
                             eprintln!(
                                 "heartbeat-launch: sentinel {:?} detected after entry {}",
-                                queue.sentinel,
-                                queue_index,
+                                queue.sentinel, queue_index,
                             );
                             // Record the match time; we'll wait 500ms before injecting.
                             sentinel_matched_at = Some(Instant::now());
@@ -866,7 +889,9 @@ pub fn run_with_queue(
                         }
                     }
                     QueueState::SendExit => {
-                        eprintln!("heartbeat-launch: all {total} entries consumed — sending exit prompt");
+                        eprintln!(
+                            "heartbeat-launch: all {total} entries consumed — sending exit prompt"
+                        );
                         if let Some(ref mut w) = pty_writer {
                             let _ = w.write_all(queue.done_message.as_bytes());
                             let _ = w.write_all(b"\n");
@@ -904,8 +929,14 @@ mod tests {
         // We can't easily capture stdout from within the same process in a
         // unit test, so we verify exit code here and test output capture in
         // the integration test.
-        let result = run(&["echo".to_string(), "hello".to_string()], &tmp(), 10, None, None)
-            .expect("run should succeed");
+        let result = run(
+            &["echo".to_string(), "hello".to_string()],
+            &tmp(),
+            10,
+            None,
+            None,
+        )
+        .expect("run should succeed");
         assert_eq!(result.exit_code, 0, "echo should exit 0");
     }
 
@@ -914,7 +945,8 @@ mod tests {
     #[test]
     fn nonzero_exit_code_propagated() {
         // `false` always exits 1.
-        let result = run(&["false".to_string()], &tmp(), 10, None, None).expect("run should succeed");
+        let result =
+            run(&["false".to_string()], &tmp(), 10, None, None).expect("run should succeed");
         assert_ne!(result.exit_code, 0, "false should exit non-zero");
     }
 
@@ -923,8 +955,14 @@ mod tests {
     #[test]
     fn timeout_fires() {
         // Sleep for 60s but give it only 1s timeout.
-        let err = run(&["sleep".to_string(), "60".to_string()], &tmp(), 1, None, None)
-            .expect_err("should time out");
+        let err = run(
+            &["sleep".to_string(), "60".to_string()],
+            &tmp(),
+            1,
+            None,
+            None,
+        )
+        .expect_err("should time out");
         match err {
             PtyError::Timeout(secs) => assert_eq!(secs, 1),
             other => panic!("expected Timeout, got {other:?}"),

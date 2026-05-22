@@ -97,14 +97,20 @@ struct Cli {
     /// Placeholders: {index} (1-based position), {total} (total entries),
     /// {content} (the raw queue line).  A trailing newline is appended
     /// automatically.  Only used when --queue is set.
-    #[arg(long, default_value = "Entry {index} of {total}:\n{content}\n\nProcess this entry. Output the result, then ENTRY_DONE.")]
+    #[arg(
+        long,
+        default_value = "Entry {index} of {total}:\n{content}\n\nProcess this entry. Output the result, then ENTRY_DONE."
+    )]
     queue_entry_template: String,
 
     /// Message sent to the PTY after all queue entries are consumed.
     ///
     /// A trailing newline is appended automatically.
     /// Only used when --queue is set.
-    #[arg(long, default_value = "All entries processed. Output QUEUE_COMPLETE with a summary.")]
+    #[arg(
+        long,
+        default_value = "All entries processed. Output QUEUE_COMPLETE with a summary."
+    )]
     queue_done_message: String,
 
     /// Command and arguments to run inside the PTY.
@@ -189,7 +195,13 @@ fn main() {
             &queue_cfg,
         )
     } else {
-        pty::run(&cli.cmd, &cwd, cli.timeout, cli.exit_signal.as_deref(), idle_cfg.as_ref())
+        pty::run(
+            &cli.cmd,
+            &cwd,
+            cli.timeout,
+            cli.exit_signal.as_deref(),
+            idle_cfg.as_ref(),
+        )
     };
 
     match result {
