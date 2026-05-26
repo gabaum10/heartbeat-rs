@@ -533,9 +533,7 @@ pub fn run(
                     if let Some(sig) = exit_signal {
                         if sig.exists() {
                             let _ = std::fs::remove_file(sig);
-                            eprintln!(
-                                "heartbeat-launch: exit signal detected, terminating child"
-                            );
+                            eprintln!("heartbeat-launch: exit signal detected, terminating child");
 
                             #[cfg(unix)]
                             {
@@ -549,8 +547,7 @@ pub fn run(
                             }
 
                             // Grace period: wait up to 2s for clean shutdown.
-                            let term_deadline =
-                                Instant::now() + Duration::from_secs(2);
+                            let term_deadline = Instant::now() + Duration::from_secs(2);
                             while Instant::now() < term_deadline {
                                 if let Ok(Some(_)) = child.try_wait() {
                                     break;
@@ -785,9 +782,7 @@ pub fn run_with_queue(
                     if let Some(sig) = exit_signal {
                         if sig.exists() {
                             let _ = std::fs::remove_file(sig);
-                            eprintln!(
-                                "heartbeat-launch: exit signal detected, terminating child"
-                            );
+                            eprintln!("heartbeat-launch: exit signal detected, terminating child");
 
                             #[cfg(unix)]
                             {
@@ -801,8 +796,7 @@ pub fn run_with_queue(
                             }
 
                             // Grace period: wait up to 2s for clean shutdown.
-                            let term_deadline =
-                                Instant::now() + Duration::from_secs(2);
+                            let term_deadline = Instant::now() + Duration::from_secs(2);
                             while Instant::now() < term_deadline {
                                 if let Ok(Some(_)) = child.try_wait() {
                                     break;
@@ -1069,7 +1063,10 @@ mod tests {
 
         writer_thread.join().expect("writer thread panicked");
 
-        assert_ne!(result.exit_code, 0, "child should exit with signal-death code after SIGTERM");
+        assert_ne!(
+            result.exit_code, 0,
+            "child should exit with signal-death code after SIGTERM"
+        );
         // Signal file should have been consumed when the exit was triggered.
         assert!(
             !signal_path.exists(),
