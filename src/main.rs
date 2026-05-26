@@ -159,8 +159,8 @@ fn main() {
                 }
             };
 
-            let mode = hook::Mode::from(args.mode);
-            if args.idle_interval > 0 {
+            let mode = hook::Mode::from(args.mode.clone());
+            if matches!(args.mode, CliMode::Persist) && args.idle_interval > 0 {
                 eprintln!(
                     "heartbeat-stop: idle sleep {}s — ensure hook timeout > {}s",
                     args.idle_interval, args.idle_interval
