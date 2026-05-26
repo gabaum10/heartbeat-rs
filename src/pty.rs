@@ -541,16 +541,53 @@ pub fn run(
                 }
 
                 // Check exit signal file. When heartbeat-stop decides Approve
-                // it touches this file; we write /exit\n to the PTY master and
-                // delete the file so the child receives the exit command once.
+                // it touches this file; we SIGTERM the process group (with a
+                // 2-second grace period) then SIGKILL if it hasn't exited.
                 if !exit_sent {
                     if let Some(sig) = exit_signal {
                         if sig.exists() {
-                            if let Some(ref mut w) = pty_writer {
-                                send_exit_command(w, sig);
-                            } else {
-                                let _ = std::fs::remove_file(sig);
+                            let _ = std::fs::remove_file(sig);
+                            eprintln!(
+                                "heartbeat-launch: exit signal detected, terminating child"
+                            );
+
+                            #[cfg(unix)]
+                            {
+                                if let Some(pgid) = master.process_group_leader() {
+                                    // SAFETY: pgid is a valid process group id
+                                    // returned by the OS.
+                                    unsafe {
+                                        libc::killpg(pgid, libc::SIGTERM);
+                                    }
+                                }
                             }
+
+                            // Grace period: wait up to 2s for clean shutdown.
+                            let term_deadline =
+                                Instant::now() + Duration::from_secs(2);
+                            while Instant::now() < term_deadline {
+                                if let Ok(Some(_)) = child.try_wait() {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(50));
+                            }
+
+                            // Force kill if still alive after grace period.
+                            if child.try_wait().map(|s| s.is_none()).unwrap_or(true) {
+                                eprintln!(
+                                    "heartbeat-launch: child did not exit on SIGTERM, sending SIGKILL"
+                                );
+                                #[cfg(unix)]
+                                {
+                                    if let Some(pgid) = master.process_group_leader() {
+                                        unsafe {
+                                            libc::killpg(pgid, libc::SIGKILL);
+                                        }
+                                    }
+                                }
+                                let _ = killer.kill();
+                            }
+
                             exit_sent = true;
                         }
                     }
@@ -761,11 +798,48 @@ pub fn run_with_queue(
                 if !exit_sent {
                     if let Some(sig) = exit_signal {
                         if sig.exists() {
-                            if let Some(ref mut w) = pty_writer {
-                                send_exit_command(w, sig);
-                            } else {
-                                let _ = fs::remove_file(sig);
+                            let _ = std::fs::remove_file(sig);
+                            eprintln!(
+                                "heartbeat-launch: exit signal detected, terminating child"
+                            );
+
+                            #[cfg(unix)]
+                            {
+                                if let Some(pgid) = master.process_group_leader() {
+                                    // SAFETY: pgid is a valid process group id
+                                    // returned by the OS.
+                                    unsafe {
+                                        libc::killpg(pgid, libc::SIGTERM);
+                                    }
+                                }
                             }
+
+                            // Grace period: wait up to 2s for clean shutdown.
+                            let term_deadline =
+                                Instant::now() + Duration::from_secs(2);
+                            while Instant::now() < term_deadline {
+                                if let Ok(Some(_)) = child.try_wait() {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(50));
+                            }
+
+                            // Force kill if still alive after grace period.
+                            if child.try_wait().map(|s| s.is_none()).unwrap_or(true) {
+                                eprintln!(
+                                    "heartbeat-launch: child did not exit on SIGTERM, sending SIGKILL"
+                                );
+                                #[cfg(unix)]
+                                {
+                                    if let Some(pgid) = master.process_group_leader() {
+                                        unsafe {
+                                            libc::killpg(pgid, libc::SIGKILL);
+                                        }
+                                    }
+                                }
+                                let _ = killer.kill();
+                            }
+
                             exit_sent = true;
                         }
                     }
