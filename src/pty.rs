@@ -610,6 +610,7 @@ pub fn run(
     // Normal exit: shut down reader thread.
     join_reader(reader_thread, &stop, master);
 
+    let exit_code = if exit_sent { 0 } else { exit_code };
     Ok(RunResult { exit_code })
 }
 
@@ -963,6 +964,7 @@ pub fn run_with_queue(
     };
 
     join_reader(reader_thread, &stop, master);
+    let exit_code = if exit_sent { 0 } else { exit_code };
     Ok(RunResult { exit_code })
 }
 
@@ -1049,9 +1051,8 @@ mod tests {
         });
 
         // `read line` blocks on stdin until it receives input. The poll loop
-        // detects the signal file and sends SIGTERM; the shell dies with a
-        // non-zero exit code. We only assert the child is dead — not the
-        // specific code — because signal-death codes are platform-dependent.
+        // detects the signal file and sends SIGTERM; the shell dies, but
+        // exit_sent overrides the code to 0 — clean exit is clean exit.
         let result = run(
             &["sh".to_string(), "-c".to_string(), "read line".to_string()],
             &tmp(),
@@ -1063,9 +1064,9 @@ mod tests {
 
         writer_thread.join().expect("writer thread panicked");
 
-        assert_ne!(
+        assert_eq!(
             result.exit_code, 0,
-            "child should exit with signal-death code after SIGTERM"
+            "child killed via exit-signal should return exit code 0"
         );
         // Signal file should have been consumed when the exit was triggered.
         assert!(
