@@ -128,20 +128,6 @@ fn join_reader(
     // Thread abandoned — do not join to avoid blocking indefinitely.
 }
 
-/// Write `/exit\n` to the PTY master to ask an interactive child (e.g. Claude
-/// Code) to exit cleanly, then delete the signal file.
-///
-/// Best-effort: errors are ignored so the caller continues polling for child
-/// exit regardless.
-///
-/// `writer` is the already-acquired PTY master writer (taken once at poll-loop
-/// start so it can also be used for keepalive injection).
-fn send_exit_command(writer: &mut Box<dyn Write + Send>, signal_path: &Path) {
-    let _ = writer.write_all(b"/exit\n");
-    let _ = writer.flush();
-    let _ = std::fs::remove_file(signal_path);
-}
-
 // ---------------------------------------------------------------------------
 // Shared PTY spawn helper
 // ---------------------------------------------------------------------------
@@ -1043,14 +1029,15 @@ mod tests {
         }
     }
 
-    /// Signal file triggers /exit: create the signal file while a long-running
+    /// Signal file triggers SIGTERM: create the signal file while a long-running
     /// command is inside the PTY and verify the child exits within a reasonable
     /// deadline.
     ///
     /// We spawn `sh -c 'read line'` which blocks waiting for stdin input.
     /// A background thread creates the signal file after a short delay.
-    /// heartbeat-launch's poll loop detects the file, writes `/exit\n` to the
-    /// PTY master, and the shell receives it on stdin — causing it to exit.
+    /// heartbeat-launch's poll loop detects the file, sends SIGTERM to the
+    /// child process group, and the shell is killed — causing it to exit with
+    /// a non-zero (signal-death) exit code.
     #[cfg(unix)]
     #[test]
     fn exit_signal_triggers_child_exit() {
@@ -1067,9 +1054,10 @@ mod tests {
             fs::write(&signal_path_clone, b"").expect("write signal file");
         });
 
-        // `read line` blocks on stdin until it receives a line.
-        // When /exit\n is written to the PTY master the shell reads it,
-        // processes it as the value for `line`, and returns 0.
+        // `read line` blocks on stdin until it receives input. The poll loop
+        // detects the signal file and sends SIGTERM; the shell dies with a
+        // non-zero exit code. We only assert the child is dead — not the
+        // specific code — because signal-death codes are platform-dependent.
         let result = run(
             &["sh".to_string(), "-c".to_string(), "read line".to_string()],
             &tmp(),
@@ -1081,11 +1069,11 @@ mod tests {
 
         writer_thread.join().expect("writer thread panicked");
 
-        assert_eq!(result.exit_code, 0, "child should exit 0 after signal");
-        // Signal file should have been deleted by send_exit_command.
+        assert_ne!(result.exit_code, 0, "child should exit with signal-death code after SIGTERM");
+        // Signal file should have been consumed when the exit was triggered.
         assert!(
             !signal_path.exists(),
-            "signal file should be deleted after /exit is sent"
+            "signal file should be deleted after SIGTERM is sent"
         );
     }
 
