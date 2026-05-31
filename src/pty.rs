@@ -371,9 +371,10 @@ fn tick_idle(
             let _ = w.flush();
             // Brief pause to let the model process the cancel.
             thread::sleep(Duration::from_millis(500));
-            // Inject the keepalive prompt.
+            // Inject the keepalive prompt. CR submits; LF only inserts a
+            // newline in the multi-line editor and never submits.
             let _ = w.write_all(state.prompt.as_bytes());
-            let _ = w.write_all(b"\n");
+            let _ = w.write_all(b"\r");
             let _ = w.flush();
         }
 
@@ -759,6 +760,10 @@ pub fn run_with_queue(
     let mut queue_index: usize = 0;
     // Timestamp of last sentinel match (used for 500ms post-sentinel delay).
     let mut sentinel_matched_at: Option<Instant> = None;
+    // Timestamp of last PTY injection; sentinel scanning is suppressed for
+    // 3 seconds after injection to ignore the echo of the injected text
+    // (which contains the sentinel string) and prevent false-positive matches.
+    let mut last_injection_at: Option<Instant> = None;
     let boot_delay = Duration::from_secs(queue.boot_delay_secs);
 
     let exit_code = loop {
@@ -884,6 +889,17 @@ pub fn run_with_queue(
                         }
                     }
                     QueueState::WaitForSentinel => {
+                        // Suppress sentinel scanning during the echo window: the
+                        // injected entry template contains the sentinel string, so the
+                        // PTY echo of the injected text would trigger a false match.
+                        // Skip scanning for 3 seconds after any injection.
+                        if let Some(injected_at) = last_injection_at {
+                            if injected_at.elapsed() < Duration::from_secs(3) {
+                                thread::sleep(poll_interval);
+                                continue;
+                            }
+                        }
+
                         // Scan sentinel buffer for the sentinel string.
                         let found = {
                             let buf = sentinel_buf.lock().unwrap_or_else(|e| e.into_inner());
@@ -902,6 +918,8 @@ pub fn run_with_queue(
                             );
                             // Record the match time; we'll wait 500ms before injecting.
                             sentinel_matched_at = Some(Instant::now());
+                            // Real sentinel found — clear the injection echo guard.
+                            last_injection_at = None;
                             queue_index += 1;
                             queue_state = QueueState::InjectNext;
                             // Fall through to InjectNext this tick (no continue).
@@ -938,10 +956,18 @@ pub fn run_with_queue(
                                 queue_index + 1,
                             );
                             if let Some(ref mut w) = pty_writer {
+                                // ESC-ESC: clear any pending input state in the TUI
+                                // (matches space-crane's working injection pattern).
+                                let _ = w.write_all(b"\x1b\x1b");
+                                let _ = w.flush();
+                                thread::sleep(Duration::from_millis(50));
                                 let _ = w.write_all(msg.as_bytes());
-                                let _ = w.write_all(b"\n");
+                                // CR (carriage return) submits input; LF only adds a
+                                // newline inside the multi-line editor and never submits.
+                                let _ = w.write_all(b"\r");
                                 let _ = w.flush();
                             }
+                            last_injection_at = Some(Instant::now());
                             queue_state = QueueState::WaitForSentinel;
                         } else {
                             // All entries consumed.
@@ -953,10 +979,15 @@ pub fn run_with_queue(
                             "heartbeat-launch: all {total} entries consumed — sending exit prompt"
                         );
                         if let Some(ref mut w) = pty_writer {
+                            // ESC-ESC preamble + CR submit (matches entry injection pattern).
+                            let _ = w.write_all(b"\x1b\x1b");
+                            let _ = w.flush();
+                            thread::sleep(Duration::from_millis(50));
                             let _ = w.write_all(queue.done_message.as_bytes());
-                            let _ = w.write_all(b"\n");
+                            let _ = w.write_all(b"\r");
                             let _ = w.flush();
                         }
+                        last_injection_at = Some(Instant::now());
                         queue_state = QueueState::DoneWaitingForExit { entered_at: Instant::now() };
                     }
                     QueueState::DoneWaitingForExit { entered_at } => {
@@ -967,7 +998,7 @@ pub fn run_with_queue(
                                 "heartbeat-launch: done-wait timeout — injecting /exit"
                             );
                             if let Some(ref mut w) = pty_writer {
-                                let _ = w.write_all(b"/exit\n");
+                                let _ = w.write_all(b"/exit\r");
                                 let _ = w.flush();
                             }
                             queue_state = QueueState::Done;
