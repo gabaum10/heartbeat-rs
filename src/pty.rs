@@ -305,7 +305,7 @@ struct IdleState {
     last_keepalive: Option<Instant>,
 }
 
-const KEEPALIVE_GRACE_SECS: u64 = 5;
+const KEEPALIVE_GRACE_SECS: u64 = 20;
 
 impl IdleState {
     fn from_config(idle: Option<&IdleConfig>) -> Self {
@@ -655,6 +655,11 @@ enum QueueState {
     SendExit,
     /// Done — poll loop should terminate.
     Done,
+    /// Done message sent; waiting up to 60s then injecting /exit.
+    DoneWaitingForExit {
+        /// When we entered this state.
+        entered_at: Instant,
+    },
 }
 
 /// Allocate a PTY, spawn `argv` inside it, stream stdout to the current
@@ -830,7 +835,7 @@ pub fn run_with_queue(
                 // Suppressed during WaitingForBoot: the child hasn't received
                 // any work yet and we don't want spurious keepalive injections
                 // during the startup silence window.
-                let skip_idle = queue_state == QueueState::WaitingForBoot;
+                let skip_idle = matches!(queue_state, QueueState::WaitingForBoot | QueueState::Done | QueueState::DoneWaitingForExit { .. });
                 if let IdleTick::Exhausted =
                     tick_idle(&mut idle_state, &last_output, &mut pty_writer, skip_idle)
                 {
@@ -906,7 +911,7 @@ pub fn run_with_queue(
                         }
                     }
                     QueueState::InjectNext => {}
-                    QueueState::SendExit | QueueState::Done => {}
+                    QueueState::SendExit | QueueState::Done | QueueState::DoneWaitingForExit { .. } => {}
                 }
                 // Second match for states that fall through or are already here.
                 match queue_state {
@@ -952,7 +957,21 @@ pub fn run_with_queue(
                             let _ = w.write_all(b"\n");
                             let _ = w.flush();
                         }
-                        queue_state = QueueState::Done;
+                        queue_state = QueueState::DoneWaitingForExit { entered_at: Instant::now() };
+                    }
+                    QueueState::DoneWaitingForExit { entered_at } => {
+                        // Give the clone up to 60s to respond to the done_message,
+                        // then inject /exit to trigger Claude Code's built-in exit.
+                        if entered_at.elapsed() >= Duration::from_secs(60) {
+                            eprintln!(
+                                "heartbeat-launch: done-wait timeout — injecting /exit"
+                            );
+                            if let Some(ref mut w) = pty_writer {
+                                let _ = w.write_all(b"/exit\n");
+                                let _ = w.flush();
+                            }
+                            queue_state = QueueState::Done;
+                        }
                     }
                     _ => {}
                 }
