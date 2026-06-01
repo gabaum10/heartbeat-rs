@@ -370,7 +370,7 @@ fn tick_idle(
 ///
 /// `idle` — optional idle detection config. When `idle.timeout_secs > 0` and
 /// the PTY produces no output for that many seconds, ESC-ESC followed by
-/// `idle.prompt` and a carriage return is injected to unstick a stalled session. After
+/// the `idle` keepalive text and a carriage return is sent to unstick a stalled session. After
 /// `idle.max_retries` injections without recovery, the child is killed.
 pub fn run(
     argv: &[String],

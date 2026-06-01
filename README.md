@@ -204,7 +204,7 @@ Claude Code checks whether its stdout is a TTY to decide whether to run in inter
 
 `heartbeat-launch` is feature-gated (`--features launch`) to keep the default binary's dependency footprint minimal. Scripts that don't need TTY allocation can invoke `claude` directly when a TTY is already present or when `sdk-cli` mode is acceptable.
 
-**The launcher is load-bearing.** It's where you poll for new work (IMAP, ticket API, file watcher, CI webhook), format the prompt, write to the inbox, and start `claude`. Different use cases write different launchers. The hook binary is the same everywhere.
+**Your wrapper script is load-bearing.** It's where you poll for new work (IMAP, ticket API, file watcher, CI webhook), format the prompt, write to the inbox, and start `claude`. Different use cases write different launchers. The hook binary is the same everywhere.
 
 ### Example: Timer-Triggered Email Triage
 
