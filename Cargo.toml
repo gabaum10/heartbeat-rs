@@ -1,6 +1,6 @@
 [package]
 name = "heartbeat-rs"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 description = "Heartbeat pattern for persistent AI CLI sessions — stop hook (heartbeat-stop) and PTY launcher (heartbeat-launch)"
 license = "MIT"
@@ -20,7 +20,7 @@ path = "src/launch.rs"
 required-features = ["launch"]
 
 [features]
-launch = ["dep:portable-pty", "dep:anyhow", "dep:libc", "dep:strip-ansi-escapes"]
+launch = ["dep:portable-pty", "dep:anyhow", "dep:libc"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -32,7 +32,6 @@ thiserror = "2"
 portable-pty = { version = "0.9", optional = true }
 anyhow = { version = "1", optional = true }
 libc = { version = "0.2", optional = true }
-strip-ansi-escapes = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

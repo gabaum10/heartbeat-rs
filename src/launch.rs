@@ -11,7 +11,7 @@
 //! The consumer handles all of that.
 
 use clap::Parser;
-use heartbeat_rs::pty::{self, IdleConfig, QueueConfig};
+use heartbeat_rs::pty::{self, IdleConfig};
 use std::path::PathBuf;
 use std::process;
 
@@ -70,48 +70,6 @@ struct Cli {
     /// Only used when --idle-timeout > 0.
     #[arg(long, default_value = "3")]
     max_idle_retries: u32,
-
-    /// Path to a JSONL queue file.  Enables queue mode.
-    ///
-    /// When set, each line of the file is treated as one queue entry.  The
-    /// controller injects entries one at a time, waiting for --queue-sentinel
-    /// between each injection.
-    #[arg(long)]
-    queue: Option<PathBuf>,
-
-    /// Sentinel string to detect in PTY output between queue entries.
-    ///
-    /// Only used when --queue is set.
-    #[arg(long, default_value = "ENTRY_DONE")]
-    queue_sentinel: String,
-
-    /// Seconds of output silence after boot before injecting the first entry.
-    ///
-    /// Gives Claude time to load context files before the first entry arrives.
-    /// Only used when --queue is set.
-    #[arg(long, default_value = "5")]
-    queue_boot_delay: u64,
-
-    /// Format string for each injected queue entry.
-    ///
-    /// Placeholders: {index} (1-based position), {total} (total entries),
-    /// {content} (the raw queue line).  A trailing newline is appended
-    /// automatically.  Only used when --queue is set.
-    #[arg(
-        long,
-        default_value = "Entry {index} of {total}:\n{content}\n\nProcess this entry. Output the result, then ENTRY_DONE."
-    )]
-    queue_entry_template: String,
-
-    /// Message sent to the PTY after all queue entries are consumed.
-    ///
-    /// A trailing newline is appended automatically.
-    /// Only used when --queue is set.
-    #[arg(
-        long,
-        default_value = "All entries processed. Output QUEUE_COMPLETE with a summary."
-    )]
-    queue_done_message: String,
 
     /// Command and arguments to run inside the PTY.
     /// Pass everything after `--`.
@@ -172,37 +130,13 @@ fn main() {
         None
     };
 
-    let result = if let Some(queue_path) = cli.queue {
-        let queue_cfg = QueueConfig {
-            queue_path,
-            sentinel: cli.queue_sentinel,
-            boot_delay_secs: cli.queue_boot_delay,
-            entry_template: cli.queue_entry_template,
-            done_message: cli.queue_done_message,
-        };
-        eprintln!(
-            "heartbeat-launch: queue mode enabled — file={}, sentinel={:?}, boot_delay={}s",
-            queue_cfg.queue_path.display(),
-            queue_cfg.sentinel,
-            queue_cfg.boot_delay_secs,
-        );
-        pty::run_with_queue(
-            &cli.cmd,
-            &cwd,
-            cli.timeout,
-            cli.exit_signal.as_deref(),
-            idle_cfg.as_ref(),
-            &queue_cfg,
-        )
-    } else {
-        pty::run(
-            &cli.cmd,
-            &cwd,
-            cli.timeout,
-            cli.exit_signal.as_deref(),
-            idle_cfg.as_ref(),
-        )
-    };
+    let result = pty::run(
+        &cli.cmd,
+        &cwd,
+        cli.timeout,
+        cli.exit_signal.as_deref(),
+        idle_cfg.as_ref(),
+    );
 
     match result {
         Ok(result) => {

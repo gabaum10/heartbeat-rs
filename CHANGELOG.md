@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-05-31
+
+### Removed
+
+- PTY queue mode: `--queue`, `--queue-sentinel`, `--queue-boot-delay`,
+  `--queue-entry-template`, `--queue-done-message` flags and the
+  `run_with_queue` / `QueueConfig` / `QueueState` / sentinel-reader internals (#10).
+  Prompt delivery is now exclusively the heartbeat-stop inbox/Stop-hook path.
+
 ## [0.4.0] - 2026-05-20
 
 ### Added
