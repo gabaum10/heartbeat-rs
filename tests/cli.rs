@@ -105,12 +105,19 @@ fn happy_path_deliver_ack_exit_codes_and_stdout() {
         .unwrap_or(0);
     assert_eq!(cursor, 0, "cursor must not advance on delivery");
 
-    // Tick 2: .responded present, inbox empty after ack → Approve.
-    // Empty stdout = approve.
+    // Tick 2: .responded present, inbox empty after ack → Block /exit.
+    // Drain-mode exit injects /exit as the next user turn so CC terminates.
     let out2 = run_hook(&inbox, "drain");
-    assert_eq!(out2.status.code(), Some(0), "hook must exit 0 on approve");
+    assert_eq!(out2.status.code(), Some(0), "hook must exit 0 on drain-exit");
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
-    assert!(stdout2.is_empty(), "approve tick must produce empty stdout");
+    assert!(
+        !stdout2.is_empty(),
+        "drain-exit tick must produce non-empty stdout (block /exit)"
+    );
+    let parsed2: serde_json::Value =
+        serde_json::from_str(&stdout2).expect("drain-exit stdout must be valid JSON");
+    assert_eq!(parsed2["decision"], "block");
+    assert_eq!(parsed2["reason"], "/exit");
 
     // .responded and .in-flight must be gone.
     assert!(

@@ -88,7 +88,7 @@ pub fn run(inbox_path: &Path, mode: &Mode, idle_interval_secs: u64) -> Result<De
         //   3. Remove .responded.
         //   4. Read next entry (deferred — no cursor advance yet).
         //   5. If found: write new .in-flight, touch .responded, emit Block.
-        //   6. If empty: emit Approve / IdleTick.
+        //   6. If empty: emit Block /exit (drain) / IdleTick (persist).
         let in_flight_entry = match InFlightEntry::read_from(&in_flight_path)? {
             Some(entry) => entry,
             None => {
@@ -179,7 +179,7 @@ pub fn serialize(decision: &Decision) -> String {
 
 fn approve_or_idle(mode: &Mode, idle_interval_secs: u64) -> Decision {
     match mode {
-        Mode::Drain => Decision::Approve,
+        Mode::Drain => Decision::Block("/exit".to_string()),
         Mode::Persist => {
             if idle_interval_secs > 0 {
                 std::thread::sleep(Duration::from_secs(idle_interval_secs));
@@ -276,7 +276,7 @@ mod tests {
         let inbox = make_inbox(&dir);
 
         let decision = run(&inbox, &Mode::Drain, 0).unwrap();
-        assert_eq!(decision, Decision::Approve);
+        assert_eq!(decision, Decision::Block("/exit".to_string()));
     }
 
     #[test]
@@ -332,9 +332,9 @@ mod tests {
         // First tick: deliver.
         run(&inbox, &Mode::Drain, 0).unwrap();
 
-        // Second tick: agent replied, inbox empty → approve.
+        // Second tick: agent replied, inbox empty → block /exit.
         let decision = run(&inbox, &Mode::Drain, 0).unwrap();
-        assert_eq!(decision, Decision::Approve);
+        assert_eq!(decision, Decision::Block("/exit".to_string()));
 
         // .responded and .in-flight should both be gone.
         assert!(!responded(&dir).exists());
@@ -558,7 +558,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// Drain mode with a nonexistent inbox file (no file created at all) →
-    /// Decision::Approve. Exercises the NotFound → Ok(None) path in
+    /// Decision::Block("/exit"). Exercises the NotFound → Ok(None) path in
     /// inbox::read_next_entry: the inbox file doesn't exist, read_next_entry
     /// returns Ok(None), and the hook must approve rather than error.
     #[test]
@@ -570,7 +570,7 @@ mod tests {
         let decision = run(&inbox, &Mode::Drain, 0).unwrap();
         assert_eq!(
             decision,
-            Decision::Approve,
+            Decision::Block("/exit".to_string()),
             "nonexistent inbox must approve in drain mode — no entries means done"
         );
     }
@@ -604,7 +604,7 @@ mod tests {
 
         // Tick 3: ack second, inbox drained → approve.
         let d3 = run(&inbox, &Mode::Drain, 0).unwrap();
-        assert_eq!(d3, Decision::Approve);
+        assert_eq!(d3, Decision::Block("/exit".to_string()));
     }
 
     // -------------------------------------------------------------------------
@@ -616,7 +616,7 @@ mod tests {
     ///
     /// This validates the full deliver→ack→advance cycle end-to-end at the hook
     /// orchestration level: each Block carries the correct content in file order,
-    /// the cursor advances only on ack (Fix B), and the terminal Approve fires
+    /// the cursor advances only on ack (Fix B), and the terminal drain-exit fires
     /// exactly when the last entry is acknowledged with nothing remaining.
     ///
     /// Entries and their byte extents (all plain-text with '\n'):
@@ -681,12 +681,12 @@ mod tests {
             "tick 3 must write .in-flight for 'charlie'"
         );
 
-        // Tick 4: .responded present → ack "charlie", inbox drained → Approve.
+        // Tick 4: .responded present → ack "charlie", inbox drained → Block /exit.
         let d4 = run(&inbox, &Mode::Drain, 0).unwrap();
         assert_eq!(
             d4,
-            Decision::Approve,
-            "tick 4 must approve once all entries are drained"
+            Decision::Block("/exit".to_string()),
+            "tick 4 must return drain-exit block once all entries are drained"
         );
         // Cursor must now sit at end_offset of "charlie" = 20.
         assert_eq!(
