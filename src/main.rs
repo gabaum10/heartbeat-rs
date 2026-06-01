@@ -20,7 +20,7 @@ use std::path::PathBuf;
     about = "Claude Code stop hook for autonomous agent loops",
     long_about = "Reads from a JSONL inbox at a byte offset and outputs a block/approve \
                   decision. Used as a Stop hook in .claude/settings.json to keep a \
-                  Claude Code session alive while messages are queued.\n\n\
+                  Claude Code session alive while the inbox has undelivered messages.\n\n\
                   Also provides `recover` subcommand for launcher-side orphan recovery."
 )]
 struct Args {
@@ -50,8 +50,8 @@ struct Args {
     ///
     /// When the hook decides Approve (session should end), it touches this
     /// file before printing the empty approve output. heartbeat-launch polls
-    /// for the file and writes `/exit\n` to the PTY master when it appears,
-    /// allowing the child (e.g. Claude Code) to exit cleanly.
+    /// for the file and terminates the child's process group (SIGTERM then
+    /// SIGKILL) when it appears, ending the session.
     ///
     /// Must match the `--exit-signal` value passed to heartbeat-launch.
     /// If omitted, no signal-file coordination is performed.
@@ -176,8 +176,8 @@ fn main() {
             };
 
             // Signal-file coordination: when the decision is Approve, touch the
-            // signal file (if configured) so heartbeat-launch knows to send
-            // /exit\n to the PTY master. Must happen before we print the approve
+            // signal file (if configured) so heartbeat-launch knows to terminate
+            // the child's process group. Must happen before we print the approve
             // output so the launcher sees the file before Claude Code exits.
             if matches!(decision, hook::Decision::Approve) {
                 if let Some(ref sig) = args.signal_file {

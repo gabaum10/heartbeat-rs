@@ -39,8 +39,8 @@ struct Cli {
     ///
     /// When heartbeat-stop decides the session should end (Approve), it
     /// touches this file. heartbeat-launch detects the file in its poll loop,
-    /// writes `/exit\n` to the PTY master, and deletes the file. The child
-    /// then receives the command and exits normally.
+    /// deletes it, and terminates the child's process group (SIGTERM then
+    /// SIGKILL after a short grace period), ending the session.
     ///
     /// Must match the `--signal-file` value passed to heartbeat-stop.
     /// If omitted, no signal-file coordination is performed.

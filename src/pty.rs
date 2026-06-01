@@ -274,15 +274,15 @@ enum IdleTick {
 
 /// Run one idle-detection tick.
 ///
-/// `skip` — when true the check is a no-op (used during WaitingForBoot in
-/// queue mode to suppress spurious keepalives during the startup silence window).
+/// Returns `IdleTick::Ok` immediately when idle detection is disabled
+/// (`state.timeout == 0`). Otherwise it checks how long the PTY has been silent
+/// and injects a keepalive, reports recovery, or reports exhaustion accordingly.
 fn tick_idle(
     state: &mut IdleState,
     last_output: &Arc<Mutex<Instant>>,
     pty_writer: &mut Option<Box<dyn Write + Send>>,
-    skip: bool,
 ) -> IdleTick {
-    if state.timeout == 0 || skip {
+    if state.timeout == 0 {
         return IdleTick::Ok;
     }
 
@@ -365,8 +365,8 @@ fn tick_idle(
 ///
 /// `exit_signal` — optional path to a signal file. When the file appears
 /// during the poll loop (written by `heartbeat-stop` when it decides Approve),
-/// `/exit\n` is written to the PTY master and the file is deleted. The poll
-/// loop then continues waiting for the child to exit normally.
+/// the signal file is deleted and the child's process group is terminated:
+/// SIGTERM first, then SIGKILL after a short grace period if it has not exited.
 ///
 /// `idle` — optional idle detection config. When `idle.timeout_secs > 0` and
 /// the PTY produces no output for that many seconds, ESC-ESC followed by
@@ -397,8 +397,8 @@ pub fn run(
 
     // Delete any stale signal file left over from a previous crash before
     // entering the poll loop. Without this, a file orphaned by a prior
-    // abnormal exit would trigger an immediate /exit on the very first poll
-    // tick, poisoning the new session before the child has done any work.
+    // abnormal exit would trigger an immediate termination on the very first
+    // poll tick, killing the new session before the child has done any work.
     if let Some(sig) = exit_signal {
         let _ = std::fs::remove_file(sig);
     }
@@ -522,7 +522,7 @@ pub fn run(
                 // stalled generation. After max_idle_retries injections without
                 // recovery, give up and kill the child.
                 if let IdleTick::Exhausted =
-                    tick_idle(&mut idle_state, &last_output, &mut pty_writer, false)
+                    tick_idle(&mut idle_state, &last_output, &mut pty_writer)
                 {
                     eprintln!(
                         "heartbeat-launch: idle timeout fired {} time(s) without recovery — killing child",
@@ -680,9 +680,9 @@ mod tests {
         );
 
         // `echo hello` exits immediately. If the stale signal file caused an
-        // immediate /exit, the child would still exit 0 — but the important
-        // thing is that the file was deleted during startup, not during the
-        // first poll tick, so we also check that it's gone after run().
+        // immediate termination, the child would still exit 0 — but the
+        // important thing is that the file was deleted during startup, not
+        // during the first poll tick, so we also check that it's gone after run().
         let result = run(
             &["echo".to_string(), "hello".to_string()],
             &tmp(),
