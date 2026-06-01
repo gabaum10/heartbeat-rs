@@ -5,7 +5,7 @@
 //! - Spawns an arbitrary command inside it
 //! - Streams child stdout to the caller via a background thread
 //! - Polls for child exit with a configurable timeout
-//! - Detects output idle periods and injects keepalive input to unstick stalled sessions
+//! - Detects output idle periods and injects keepalive keystrokes (not prompts) to unstick stalled sessions
 //!
 //! No inbox, no settings.json, no handshake. The consumer handles all of that.
 

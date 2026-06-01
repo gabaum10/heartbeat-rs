@@ -8,8 +8,10 @@ Claude Code supports a [stop hook](https://docs.anthropic.com/en/docs/claude-cod
 
 1. An external process writes prompts to a JSONL inbox file.
 2. Claude Code starts an interactive session.
-3. After each agent response, the stop hook reads the next message from the inbox and injects it as the next user turn.
+3. After each agent response, the `heartbeat-stop` stop hook reads the next message from the inbox and delivers it as the next user turn.
 4. When the inbox is empty, the hook approves the stop and the session exits cleanly.
+
+**The JSONL inbox + `heartbeat-stop` Stop hook is the only prompt-delivery mechanism.** There is no other path by which messages reach the agent.
 
 This turns Claude Code's interactive session model into a message-driven automation runtime. Each session gets full tool access, clean context, and the same execution environment as a human-operated session -- but the messages come from a file queue instead of a keyboard.
 
@@ -192,13 +194,15 @@ The hook detects the leading `"` and unwraps the JSON string before delivery, so
 └─────────────────────────┘
 ```
 
-### PTY layer (`heartbeat-launch`)
+### PTY layer (`heartbeat-launch`, optional)
+
+`heartbeat-launch` is an optional TTY-allocation helper. It has no role in prompt delivery.
 
 Claude Code checks whether its stdout is a TTY to decide whether to run in interactive `cli` mode (full UI, tool rendering) or headless `sdk-cli` mode. When launched from a script, there is no TTY and Claude defaults to `sdk-cli`. `heartbeat-launch` allocates a real PTY via `portable-pty` and spawns the child inside it, so Claude's `isTTY` check succeeds.
 
-The PTY layer is a **process wrapper only**: it allocates a PTY, spawns the command, streams output, enforces the configurable timeout, and exits with the child's exit code. **It does not deliver prompts.** The only prompt-delivery mechanism is the `heartbeat-stop` inbox/Stop-hook path (`--mode drain`/`persist`). Queue-based PTY injection was removed in 0.5.0 (#10) because the injected-template echo could not be reliably distinguished from model output.
+`heartbeat-launch` **does not deliver prompts.** It allocates a PTY, spawns the command, streams output, enforces the configurable timeout, and exits with the child's exit code -- nothing more. The only prompt-delivery mechanism is the `heartbeat-stop` inbox/Stop-hook path (`--mode drain`/`persist`). Prompt injection via PTY was removed in 0.5.0 (#10); the inbox is the sole delivery channel.
 
-`heartbeat-launch` is feature-gated (`--features launch`) to keep the default binary's dependency footprint minimal. Scripts that don't need TTY allocation can use `heartbeat-stop` directly with `claude --print` or in environments where a TTY is already present.
+`heartbeat-launch` is feature-gated (`--features launch`) to keep the default binary's dependency footprint minimal. Scripts that don't need TTY allocation can invoke `claude` directly when a TTY is already present or when `sdk-cli` mode is acceptable.
 
 **The launcher is load-bearing.** It's where you poll for new work (IMAP, ticket API, file watcher, CI webhook), format the prompt, write to the inbox, and start `claude`. Different use cases write different launchers. The hook binary is the same everywhere.
 
