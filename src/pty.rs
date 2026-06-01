@@ -366,11 +366,12 @@ fn tick_idle(
         );
 
         if let Some(ref mut w) = pty_writer {
-            // Send ESC to cancel any stalled generation.
-            let _ = w.write_all(b"\x1b");
+            // Send ESC-ESC to cancel any stalled generation. Single ESC can
+            // be consumed as a sequence prefix; double ESC reliably cancels.
+            let _ = w.write_all(b"\x1b\x1b");
             let _ = w.flush();
             // Brief pause to let the model process the cancel.
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(50));
             // Inject the keepalive prompt. CR submits; LF only inserts a
             // newline in the multi-line editor and never submits.
             let _ = w.write_all(state.prompt.as_bytes());
@@ -429,8 +430,8 @@ fn tick_idle(
 /// loop then continues waiting for the child to exit normally.
 ///
 /// `idle` — optional idle detection config. When `idle.timeout_secs > 0` and
-/// the PTY produces no output for that many seconds, ESC followed by
-/// `idle.prompt` and a newline is injected to unstick a stalled session. After
+/// the PTY produces no output for that many seconds, ESC-ESC followed by
+/// `idle.prompt` and a carriage return is injected to unstick a stalled session. After
 /// `idle.max_retries` injections without recovery, the child is killed.
 pub fn run(
     argv: &[String],
@@ -636,7 +637,7 @@ pub struct QueueConfig {
     /// Format string for each injected entry.
     ///
     /// Placeholders: `{index}` (1-based), `{total}`, `{content}` (the raw
-    /// queue line).  Used verbatim with a trailing newline appended.
+    /// queue line).  Used verbatim with a trailing carriage return appended.
     pub entry_template: String,
     /// Message sent to the PTY after all entries are consumed, before the
     /// controller transitions to Done.
@@ -998,6 +999,9 @@ pub fn run_with_queue(
                                 "heartbeat-launch: done-wait timeout — injecting /exit"
                             );
                             if let Some(ref mut w) = pty_writer {
+                                let _ = w.write_all(b"\x1b\x1b");
+                                let _ = w.flush();
+                                thread::sleep(Duration::from_millis(50));
                                 let _ = w.write_all(b"/exit\r");
                                 let _ = w.flush();
                             }
