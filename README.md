@@ -196,7 +196,7 @@ The hook detects the leading `"` and unwraps the JSON string before delivery, so
 
 Claude Code checks whether its stdout is a TTY to decide whether to run in interactive `cli` mode (full UI, tool rendering) or headless `sdk-cli` mode. When launched from a script, there is no TTY and Claude defaults to `sdk-cli`. `heartbeat-launch` allocates a real PTY via `portable-pty` and spawns the child inside it, so Claude's `isTTY` check succeeds.
 
-The PTY layer is thin: it allocates the pair, spawns the command on the slave side, drops the slave so the master sees EOF on child exit, and runs a background thread to forward the master's output to the caller's stdout. The main thread polls for child exit in a 100ms loop and enforces the configurable timeout.
+The PTY layer is a **process wrapper only**: it allocates a PTY, spawns the command, streams output, enforces the configurable timeout, and exits with the child's exit code. **It does not deliver prompts.** The only prompt-delivery mechanism is the `heartbeat-stop` inbox/Stop-hook path (`--mode drain`/`persist`). Queue-based PTY injection was removed in 0.5.0 (#10) because the injected-template echo could not be reliably distinguished from model output.
 
 `heartbeat-launch` is feature-gated (`--features launch`) to keep the default binary's dependency footprint minimal. Scripts that don't need TTY allocation can use `heartbeat-stop` directly with `claude --print` or in environments where a TTY is already present.
 

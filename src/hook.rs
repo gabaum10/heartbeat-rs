@@ -554,6 +554,158 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // NEW: inbox hardening tests
+    // -------------------------------------------------------------------------
+
+    /// Drain mode with a nonexistent inbox file (no file created at all) →
+    /// Decision::Approve. Exercises the NotFound → Ok(None) path in
+    /// inbox::read_next_entry: the inbox file doesn't exist, read_next_entry
+    /// returns Ok(None), and the hook must approve rather than error.
+    #[test]
+    fn drain_nonexistent_inbox_approves() {
+        let dir = TempDir::new().unwrap();
+        // Deliberately do NOT create the inbox file.
+        let inbox = dir.path().join("inbox.jsonl");
+
+        let decision = run(&inbox, &Mode::Drain, 0).unwrap();
+        assert_eq!(
+            decision,
+            Decision::Approve,
+            "nonexistent inbox must approve in drain mode — no entries means done"
+        );
+    }
+
+    /// Blank line between two real messages: hook delivers first, skips the
+    /// blank line at the inbox level, then delivers second on the next round.
+    /// Tests the blank-skip property at the hook orchestration level (not just
+    /// inbox unit level).
+    #[test]
+    fn blank_line_between_entries_skipped_at_hook_level() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+
+        // Write: real message, blank line, real message.
+        write_line(&inbox, "first entry");
+        write_line(&inbox, "");
+        write_line(&inbox, "second entry");
+
+        // Tick 1: deliver first entry.
+        let d1 = run(&inbox, &Mode::Drain, 0).unwrap();
+        assert_eq!(d1, Decision::Block("first entry".to_string()));
+        assert!(responded(&dir).exists());
+
+        // Tick 2: ack first, skip blank, deliver second.
+        let d2 = run(&inbox, &Mode::Drain, 0).unwrap();
+        assert_eq!(
+            d2,
+            Decision::Block("second entry".to_string()),
+            "blank line between entries must be skipped — second entry delivered directly"
+        );
+
+        // Tick 3: ack second, inbox drained → approve.
+        let d3 = run(&inbox, &Mode::Drain, 0).unwrap();
+        assert_eq!(d3, Decision::Approve);
+    }
+
+    // -------------------------------------------------------------------------
+    // NEW (assembly graft): multi-entry byte-order delivery test
+    // -------------------------------------------------------------------------
+
+    /// Three-entry inbox delivers entries in byte order across successive
+    /// deliver→ack ticks, then approves once drained.
+    ///
+    /// This validates the full deliver→ack→advance cycle end-to-end at the hook
+    /// orchestration level: each Block carries the correct content in file order,
+    /// the cursor advances only on ack (Fix B), and the terminal Approve fires
+    /// exactly when the last entry is acknowledged with nothing remaining.
+    ///
+    /// Entries and their byte extents (all plain-text with '\n'):
+    ///   "alpha\n"   → 6 bytes  (start=0,  end=6)
+    ///   "bravo\n"   → 6 bytes  (start=6,  end=12)
+    ///   "charlie\n" → 8 bytes  (start=12, end=20)
+    #[test]
+    fn multi_entry_inbox_delivers_in_byte_order_then_approves() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+
+        write_line(&inbox, "alpha");
+        write_line(&inbox, "bravo");
+        write_line(&inbox, "charlie");
+
+        // Tick 1: first invocation, no .responded → deliver "alpha".
+        let d1 = run(&inbox, &Mode::Drain, 0).unwrap();
+        assert_eq!(
+            d1,
+            Decision::Block("alpha".to_string()),
+            "tick 1 must deliver first entry"
+        );
+        assert!(responded(&dir).exists(), "tick 1 must set .responded");
+        // Fix B: cursor must NOT advance on delivery.
+        assert_eq!(
+            inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0),
+            0,
+            "cursor must stay at 0 after delivery of first entry (Fix B)"
+        );
+
+        // Tick 2: .responded present → ack "alpha", deliver "bravo".
+        let d2 = run(&inbox, &Mode::Drain, 0).unwrap();
+        assert_eq!(
+            d2,
+            Decision::Block("bravo".to_string()),
+            "tick 2 must deliver second entry"
+        );
+        // Cursor must now sit at end_offset of "alpha" = 6.
+        assert_eq!(
+            inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0),
+            6,
+            "cursor must advance to 6 (past 'alpha\\n') after ack"
+        );
+        assert!(responded(&dir).exists(), "tick 2 must re-set .responded");
+
+        // Tick 3: .responded present → ack "bravo", deliver "charlie".
+        let d3 = run(&inbox, &Mode::Drain, 0).unwrap();
+        assert_eq!(
+            d3,
+            Decision::Block("charlie".to_string()),
+            "tick 3 must deliver third entry"
+        );
+        // Cursor must now sit at end_offset of "bravo" = 12.
+        assert_eq!(
+            inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0),
+            12,
+            "cursor must advance to 12 (past 'bravo\\n') after ack"
+        );
+        assert!(responded(&dir).exists(), "tick 3 must re-set .responded");
+        assert!(
+            in_flight(&dir).exists(),
+            "tick 3 must write .in-flight for 'charlie'"
+        );
+
+        // Tick 4: .responded present → ack "charlie", inbox drained → Approve.
+        let d4 = run(&inbox, &Mode::Drain, 0).unwrap();
+        assert_eq!(
+            d4,
+            Decision::Approve,
+            "tick 4 must approve once all entries are drained"
+        );
+        // Cursor must now sit at end_offset of "charlie" = 20.
+        assert_eq!(
+            inbox::read_offset(&offset(&dir)).unwrap().unwrap_or(0),
+            20,
+            "cursor must advance to 20 (past 'charlie\\n') after final ack"
+        );
+        // Both .responded and .in-flight must be cleaned up.
+        assert!(
+            !responded(&dir).exists(),
+            ".responded must be removed after final ack"
+        );
+        assert!(
+            !in_flight(&dir).exists(),
+            ".in-flight must be removed after final ack"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // NEW: Optional hook.rs test — InconsistentState variant (lil-grabby §9)
     // -------------------------------------------------------------------------
 

@@ -231,67 +231,6 @@ fn spawn_basic_reader(
     })
 }
 
-/// Spawn a sentinel-aware reader thread: forwards PTY output to stdout, stamps
-/// `last_output`, marks `seen_output`, and appends ANSI-stripped bytes to
-/// `sentinel_buf` for the queue controller to scan.
-#[cfg(feature = "launch")]
-fn spawn_sentinel_reader(
-    mut reader: Box<dyn Read + Send>,
-    stop_reader: Arc<Mutex<bool>>,
-    last_output_reader: Arc<Mutex<Instant>>,
-    seen_output_reader: Arc<Mutex<bool>>,
-    sentinel_buf_reader: Arc<Mutex<Vec<u8>>>,
-    sentinel_len: usize,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let stdout = io::stdout();
-        let mut buf = [0u8; 4096];
-        loop {
-            if stop_reader.lock().is_ok_and(|g| *g) {
-                break;
-            }
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    // Update activity timestamp.
-                    if let Ok(mut ts) = last_output_reader.lock() {
-                        *ts = Instant::now();
-                    }
-                    // Mark that we've seen at least one byte of output.
-                    if let Ok(mut seen) = seen_output_reader.lock() {
-                        *seen = true;
-                    }
-
-                    let raw_chunk = &buf[..n];
-
-                    // Forward raw bytes to stdout (user sees unmodified output).
-                    let mut out = stdout.lock();
-                    if out.write_all(raw_chunk).is_err() {
-                        break;
-                    }
-                    let _ = out.flush();
-
-                    // Append ANSI-stripped bytes to the sentinel buffer.
-                    // strip() returns a new Vec; we append its contents.
-                    let clean = strip_ansi_escapes::strip(raw_chunk);
-                    if let Ok(mut sbuf) = sentinel_buf_reader.lock() {
-                        sbuf.extend_from_slice(&clean);
-                        // Keep the most recent 8 KB plus one extra sentinel_len
-                        // so a match can never be split across a drain boundary.
-                        let keep = 8192 + sentinel_len;
-                        if sbuf.len() > keep * 2 {
-                            let drain = sbuf.len() - keep;
-                            sbuf.drain(..drain);
-                        }
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Shared idle detection helper
 // ---------------------------------------------------------------------------
@@ -335,15 +274,15 @@ enum IdleTick {
 
 /// Run one idle-detection tick.
 ///
-/// `skip` — when true the check is a no-op (used during WaitingForBoot in
-/// queue mode to suppress spurious keepalives during the startup silence window).
+/// Returns `IdleTick::Ok` immediately when idle detection is disabled
+/// (`state.timeout == 0`). Otherwise it checks how long the PTY has been silent
+/// and injects a keepalive, reports recovery, or reports exhaustion accordingly.
 fn tick_idle(
     state: &mut IdleState,
     last_output: &Arc<Mutex<Instant>>,
     pty_writer: &mut Option<Box<dyn Write + Send>>,
-    skip: bool,
 ) -> IdleTick {
-    if state.timeout == 0 || skip {
+    if state.timeout == 0 {
         return IdleTick::Ok;
     }
 
@@ -426,8 +365,8 @@ fn tick_idle(
 ///
 /// `exit_signal` — optional path to a signal file. When the file appears
 /// during the poll loop (written by `heartbeat-stop` when it decides Approve),
-/// `/exit\n` is written to the PTY master and the file is deleted. The poll
-/// loop then continues waiting for the child to exit normally.
+/// the signal file is deleted and the child's process group is terminated:
+/// SIGTERM first, then SIGKILL after a short grace period if it has not exited.
 ///
 /// `idle` — optional idle detection config. When `idle.timeout_secs > 0` and
 /// the PTY produces no output for that many seconds, ESC-ESC followed by
@@ -458,8 +397,8 @@ pub fn run(
 
     // Delete any stale signal file left over from a previous crash before
     // entering the poll loop. Without this, a file orphaned by a prior
-    // abnormal exit would trigger an immediate /exit on the very first poll
-    // tick, poisoning the new session before the child has done any work.
+    // abnormal exit would trigger an immediate termination on the very first
+    // poll tick, killing the new session before the child has done any work.
     if let Some(sig) = exit_signal {
         let _ = std::fs::remove_file(sig);
     }
@@ -583,7 +522,7 @@ pub fn run(
                 // stalled generation. After max_idle_retries injections without
                 // recovery, give up and kill the child.
                 if let IdleTick::Exhausted =
-                    tick_idle(&mut idle_state, &last_output, &mut pty_writer, false)
+                    tick_idle(&mut idle_state, &last_output, &mut pty_writer)
                 {
                     eprintln!(
                         "heartbeat-launch: idle timeout fired {} time(s) without recovery — killing child",
@@ -612,412 +551,6 @@ pub fn run(
     // Normal exit: shut down reader thread.
     join_reader(reader_thread, &stop, master);
 
-    let exit_code = if exit_sent { 0 } else { exit_code };
-    Ok(RunResult { exit_code })
-}
-
-// ---------------------------------------------------------------------------
-// Queue mode
-// ---------------------------------------------------------------------------
-
-/// Configuration for queue-based input injection.
-///
-/// When queue mode is active, `run_with_queue` loads entries from a JSONL file
-/// and injects them one at a time into the PTY, waiting for a sentinel string
-/// between each injection.
-#[derive(Debug, Clone)]
-pub struct QueueConfig {
-    /// Path to the JSONL queue file. Each line is one entry.
-    pub queue_path: std::path::PathBuf,
-    /// Sentinel pattern to detect in PTY output between entries.
-    pub sentinel: String,
-    /// Seconds of output silence after first output burst before injecting
-    /// the first entry. Gives Claude time to load context files.
-    pub boot_delay_secs: u64,
-    /// Format string for each injected entry.
-    ///
-    /// Placeholders: `{index}` (1-based), `{total}`, `{content}` (the raw
-    /// queue line).  Used verbatim with a trailing carriage return appended.
-    pub entry_template: String,
-    /// Message sent to the PTY after all entries are consumed, before the
-    /// controller transitions to Done.
-    pub done_message: String,
-}
-
-/// Queue controller states.
-#[derive(Debug, Clone, PartialEq)]
-enum QueueState {
-    /// Waiting for the initial boot silence period to expire.
-    WaitingForBoot,
-    /// Entry injected; waiting for sentinel in PTY output.
-    WaitForSentinel,
-    /// Sentinel found (or boot ready); inject the next entry.
-    InjectNext,
-    /// All entries consumed; send the final exit prompt.
-    SendExit,
-    /// Done — poll loop should terminate.
-    Done,
-    /// Done message sent; waiting up to 60s then injecting /exit.
-    DoneWaitingForExit {
-        /// When we entered this state.
-        entered_at: Instant,
-    },
-}
-
-/// Allocate a PTY, spawn `argv` inside it, stream stdout to the current
-/// process's stdout, and drive a queue of entries through the session.
-///
-/// After the child produces `boot_delay_secs` seconds of output silence (post
-/// first output), the first queue entry is injected. After each sentinel is
-/// detected in the PTY output, the next entry is injected.  When all entries
-/// are consumed the `done_message` from `QueueConfig` is sent.
-///
-/// All existing safety mechanisms (idle detection, keepalive, timeout, exit
-/// signal) apply unchanged inside queue mode.  Idle detection is suppressed
-/// during the WaitingForBoot phase to avoid spurious keepalives during the
-/// startup silence window.
-#[cfg(feature = "launch")]
-pub fn run_with_queue(
-    argv: &[String],
-    cwd: &Path,
-    timeout_secs: u64,
-    exit_signal: Option<&Path>,
-    idle: Option<&IdleConfig>,
-    queue: &QueueConfig,
-) -> Result<RunResult, PtyError> {
-    use std::fs;
-
-    // Load and validate the queue file up front so we fail fast.
-    let queue_raw = fs::read_to_string(&queue.queue_path).map_err(|e| {
-        PtyError::Io(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("queue file {}: {e}", queue.queue_path.display()),
-        ))
-    })?;
-    let entries: Vec<String> = queue_raw
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
-        .collect();
-    let total = entries.len();
-    eprintln!(
-        "heartbeat-launch: queue mode — {total} entries from {}",
-        queue.queue_path.display()
-    );
-
-    let PtySpawn {
-        master,
-        mut child,
-        mut killer,
-        reader,
-    } = spawn_pty_child(argv, cwd)?;
-
-    // Shared stop flag.
-    let stop = Arc::new(Mutex::new(false));
-
-    // Shared last-output timestamp (reused for boot detection).
-    let last_output: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
-
-    // Shared sentinel buffer: reader appends ANSI-stripped output; poll loop
-    // scans for the sentinel string.  Capped at 16 KB; older bytes are dropped.
-    let sentinel_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(8192)));
-
-    // Track whether we have seen any output at all (used for boot detection).
-    let seen_output: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-
-    let reader_thread = spawn_sentinel_reader(
-        reader,
-        Arc::clone(&stop),
-        Arc::clone(&last_output),
-        Arc::clone(&seen_output),
-        Arc::clone(&sentinel_buf),
-        queue.sentinel.len(),
-    );
-
-    // Delete stale signal file.
-    if let Some(sig) = exit_signal {
-        let _ = fs::remove_file(sig);
-    }
-
-    let mut pty_writer: Option<Box<dyn Write + Send>> = master.take_writer().ok();
-
-    let poll_interval = Duration::from_millis(100);
-    let deadline = if timeout_secs > 0 {
-        Some(Instant::now() + Duration::from_secs(timeout_secs))
-    } else {
-        None
-    };
-
-    // Idle detection state. Only active when idle config is provided and
-    // idle.timeout_secs > 0.  Suppressed during WaitingForBoot.
-    let mut idle_state = IdleState::from_config(idle);
-    let mut exit_sent = false;
-
-    // -----------------------------------------------------------------
-    // Queue state machine
-    // -----------------------------------------------------------------
-    let mut queue_state = QueueState::WaitingForBoot;
-    let mut queue_index: usize = 0;
-    // Timestamp of last sentinel match (used for 500ms post-sentinel delay).
-    let mut sentinel_matched_at: Option<Instant> = None;
-    // Timestamp of last PTY injection; sentinel scanning is suppressed for
-    // 3 seconds after injection to ignore the echo of the injected text
-    // (which contains the sentinel string) and prevent false-positive matches.
-    let mut last_injection_at: Option<Instant> = None;
-    let boot_delay = Duration::from_secs(queue.boot_delay_secs);
-
-    let exit_code = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.exit_code(),
-            Ok(None) => {
-                // --- Timeout ---
-                if let Some(dl) = deadline {
-                    if Instant::now() >= dl {
-                        #[cfg(unix)]
-                        {
-                            if let Some(pgid) = master.process_group_leader() {
-                                unsafe {
-                                    libc::killpg(pgid, libc::SIGKILL);
-                                }
-                            }
-                        }
-                        let _ = killer.kill();
-                        thread::sleep(Duration::from_millis(500));
-                        join_reader(reader_thread, &stop, master);
-                        return Err(PtyError::Timeout(timeout_secs));
-                    }
-                }
-
-                // --- Exit signal ---
-                if !exit_sent {
-                    if let Some(sig) = exit_signal {
-                        if sig.exists() {
-                            let _ = std::fs::remove_file(sig);
-                            eprintln!("heartbeat-launch: exit signal detected, terminating child");
-
-                            #[cfg(unix)]
-                            {
-                                if let Some(pgid) = master.process_group_leader() {
-                                    // SAFETY: pgid is a valid process group id
-                                    // returned by the OS.
-                                    unsafe {
-                                        libc::killpg(pgid, libc::SIGTERM);
-                                    }
-                                }
-                            }
-
-                            // Grace period: wait up to 2s for clean shutdown.
-                            let term_deadline = Instant::now() + Duration::from_secs(2);
-                            while Instant::now() < term_deadline {
-                                if let Ok(Some(_)) = child.try_wait() {
-                                    break;
-                                }
-                                thread::sleep(Duration::from_millis(50));
-                            }
-
-                            // Force kill if still alive after grace period.
-                            if child.try_wait().map(|s| s.is_none()).unwrap_or(true) {
-                                eprintln!(
-                                    "heartbeat-launch: child did not exit on SIGTERM, sending SIGKILL"
-                                );
-                                #[cfg(unix)]
-                                {
-                                    if let Some(pgid) = master.process_group_leader() {
-                                        unsafe {
-                                            libc::killpg(pgid, libc::SIGKILL);
-                                        }
-                                    }
-                                }
-                                let _ = killer.kill();
-                            }
-
-                            exit_sent = true;
-                        }
-                    }
-                }
-
-                // --- Idle detection ---
-                // Suppressed during WaitingForBoot: the child hasn't received
-                // any work yet and we don't want spurious keepalive injections
-                // during the startup silence window.
-                let skip_idle = matches!(queue_state, QueueState::WaitingForBoot | QueueState::Done | QueueState::DoneWaitingForExit { .. });
-                if let IdleTick::Exhausted =
-                    tick_idle(&mut idle_state, &last_output, &mut pty_writer, skip_idle)
-                {
-                    eprintln!(
-                        "heartbeat-launch: idle timeout fired {} time(s) without recovery — killing child",
-                        idle_state.retry_count
-                    );
-                    #[cfg(unix)]
-                    {
-                        if let Some(pgid) = master.process_group_leader() {
-                            unsafe {
-                                libc::killpg(pgid, libc::SIGKILL);
-                            }
-                        }
-                    }
-                    let _ = killer.kill();
-                    thread::sleep(Duration::from_millis(500));
-                    join_reader(reader_thread, &stop, master);
-                    return Err(PtyError::IdleExhausted(idle_state.timeout));
-                }
-
-                // --- Queue state machine ---
-                match queue_state {
-                    QueueState::WaitingForBoot => {
-                        // Wait until we've seen some output AND been silent for
-                        // boot_delay_secs.
-                        let has_output = seen_output.lock().map(|g| *g).unwrap_or(false);
-                        if has_output {
-                            let silent = last_output
-                                .lock()
-                                .map(|ts| ts.elapsed())
-                                .unwrap_or(Duration::ZERO);
-                            if silent >= boot_delay {
-                                eprintln!(
-                                    "heartbeat-launch: boot complete ({:.1}s silence) — ready to inject",
-                                    silent.as_secs_f64()
-                                );
-                                queue_state = QueueState::InjectNext;
-                                // Fall through immediately to InjectNext this tick.
-                            }
-                        }
-                        // If we haven't fallen through, just sleep and loop.
-                        if queue_state == QueueState::WaitingForBoot {
-                            thread::sleep(poll_interval);
-                            continue;
-                        }
-                    }
-                    QueueState::WaitForSentinel => {
-                        // Suppress sentinel scanning during the echo window: the
-                        // injected entry template contains the sentinel string, so the
-                        // PTY echo of the injected text would trigger a false match.
-                        // Skip scanning for 3 seconds after any injection.
-                        if let Some(injected_at) = last_injection_at {
-                            if injected_at.elapsed() < Duration::from_secs(3) {
-                                thread::sleep(poll_interval);
-                                continue;
-                            }
-                        }
-
-                        // Scan sentinel buffer for the sentinel string.
-                        let found = {
-                            let buf = sentinel_buf.lock().unwrap_or_else(|e| e.into_inner());
-                            let text = String::from_utf8_lossy(&buf);
-                            text.contains(queue.sentinel.as_str())
-                        };
-
-                        if found {
-                            // Clear buffer.
-                            if let Ok(mut buf) = sentinel_buf.lock() {
-                                buf.clear();
-                            }
-                            eprintln!(
-                                "heartbeat-launch: sentinel {:?} detected after entry {}",
-                                queue.sentinel, queue_index,
-                            );
-                            // Record the match time; we'll wait 500ms before injecting.
-                            sentinel_matched_at = Some(Instant::now());
-                            // Real sentinel found — clear the injection echo guard.
-                            last_injection_at = None;
-                            queue_index += 1;
-                            queue_state = QueueState::InjectNext;
-                            // Fall through to InjectNext this tick (no continue).
-                        } else {
-                            thread::sleep(poll_interval);
-                            continue;
-                        }
-                    }
-                    QueueState::InjectNext => {}
-                    QueueState::SendExit | QueueState::Done | QueueState::DoneWaitingForExit { .. } => {}
-                }
-                // Second match for states that fall through or are already here.
-                match queue_state {
-                    QueueState::InjectNext => {
-                        // Honour the 500ms post-sentinel delay when one applies.
-                        if let Some(matched_at) = sentinel_matched_at {
-                            let elapsed = matched_at.elapsed();
-                            let delay = Duration::from_millis(500);
-                            if elapsed < delay {
-                                thread::sleep(delay - elapsed);
-                            }
-                            sentinel_matched_at = None;
-                        }
-
-                        if queue_index < total {
-                            let entry = &entries[queue_index];
-                            let msg = queue
-                                .entry_template
-                                .replace("{index}", &(queue_index + 1).to_string())
-                                .replace("{total}", &total.to_string())
-                                .replace("{content}", entry);
-                            eprintln!(
-                                "heartbeat-launch: injecting entry {}/{total}",
-                                queue_index + 1,
-                            );
-                            if let Some(ref mut w) = pty_writer {
-                                // ESC-ESC: clear any pending input state in the TUI
-                                // (matches space-crane's working injection pattern).
-                                let _ = w.write_all(b"\x1b\x1b");
-                                let _ = w.flush();
-                                thread::sleep(Duration::from_millis(50));
-                                let _ = w.write_all(msg.as_bytes());
-                                // CR (carriage return) submits input; LF only adds a
-                                // newline inside the multi-line editor and never submits.
-                                let _ = w.write_all(b"\r");
-                                let _ = w.flush();
-                            }
-                            last_injection_at = Some(Instant::now());
-                            queue_state = QueueState::WaitForSentinel;
-                        } else {
-                            // All entries consumed.
-                            queue_state = QueueState::SendExit;
-                        }
-                    }
-                    QueueState::SendExit => {
-                        eprintln!(
-                            "heartbeat-launch: all {total} entries consumed — sending exit prompt"
-                        );
-                        if let Some(ref mut w) = pty_writer {
-                            // ESC-ESC preamble + CR submit (matches entry injection pattern).
-                            let _ = w.write_all(b"\x1b\x1b");
-                            let _ = w.flush();
-                            thread::sleep(Duration::from_millis(50));
-                            let _ = w.write_all(queue.done_message.as_bytes());
-                            let _ = w.write_all(b"\r");
-                            let _ = w.flush();
-                        }
-                        last_injection_at = Some(Instant::now());
-                        queue_state = QueueState::DoneWaitingForExit { entered_at: Instant::now() };
-                    }
-                    QueueState::DoneWaitingForExit { entered_at } => {
-                        // Give the clone up to 60s to respond to the done_message,
-                        // then inject /exit to trigger Claude Code's built-in exit.
-                        if entered_at.elapsed() >= Duration::from_secs(60) {
-                            eprintln!(
-                                "heartbeat-launch: done-wait timeout — injecting /exit"
-                            );
-                            if let Some(ref mut w) = pty_writer {
-                                let _ = w.write_all(b"\x1b\x1b");
-                                let _ = w.flush();
-                                thread::sleep(Duration::from_millis(50));
-                                let _ = w.write_all(b"/exit\r");
-                                let _ = w.flush();
-                            }
-                            queue_state = QueueState::Done;
-                        }
-                    }
-                    _ => {}
-                }
-
-                thread::sleep(poll_interval);
-            }
-            Err(e) => return Err(PtyError::Io(e)),
-        }
-    };
-
-    join_reader(reader_thread, &stop, master);
     let exit_code = if exit_sent { 0 } else { exit_code };
     Ok(RunResult { exit_code })
 }
@@ -1147,9 +680,9 @@ mod tests {
         );
 
         // `echo hello` exits immediately. If the stale signal file caused an
-        // immediate /exit, the child would still exit 0 — but the important
-        // thing is that the file was deleted during startup, not during the
-        // first poll tick, so we also check that it's gone after run().
+        // immediate termination, the child would still exit 0 — but the
+        // important thing is that the file was deleted during startup, not
+        // during the first poll tick, so we also check that it's gone after run().
         let result = run(
             &["echo".to_string(), "hello".to_string()],
             &tmp(),
