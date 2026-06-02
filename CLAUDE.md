@@ -13,6 +13,6 @@ fits into dispatch, PTY mechanics, session lifecycle, and integration with heart
 
 ## Maintenance Rule
 
-If you change code in this crate, check whether the runbook needs updating.
-If the behavior changed, update the runbook. The runbook is only useful if it
-matches reality.
+**Before working in this directory, read the runbook.** It has architecture decisions, known gotchas, and context you need.
+
+If you change code here, update the runbook to match. The runbook is only useful if it matches reality.
