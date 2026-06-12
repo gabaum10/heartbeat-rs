@@ -172,6 +172,82 @@ fn timeout_zero_means_no_timeout() {
 }
 
 // ---------------------------------------------------------------------------
+// (h) Session-identity env strip: denylist vars absent, PATH survives
+//
+// Regression guard for the CHILD_SESSION/CC-2.1.175 incident. Sets all six
+// session-identity vars (plus CLAUDE_EFFORT as a spared runtime-config var)
+// in the launcher's environment, then inspects the child's env via printenv.
+// Asserts the six are absent from child output; PATH and CLAUDE_EFFORT survive.
+// This pins the denylist-not-clear posture against refactors and typos.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn session_identity_vars_stripped_from_child_env() {
+    // Build the shell command: print each var on its own line so we can do
+    // exact-string checks without worrying about ordering or separators.
+    let check_cmd = r#"
+        for var in CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH CLAUDECODE AI_AGENT CLAUDE_EFFORT PATH; do
+            val=$(printenv "$var" 2>/dev/null || true)
+            echo "VAR_${var}=${val}_END"
+        done
+    "#;
+
+    let out = Command::new(binary())
+        .arg("--timeout")
+        .arg("10")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(check_cmd)
+        // Inject denylist vars into the launcher's environment.
+        .env("CLAUDE_CODE_SESSION_ID", "should-be-stripped-sid")
+        .env("CLAUDE_CODE_CHILD_SESSION", "should-be-stripped-child")
+        .env("CLAUDE_CODE_ENTRYPOINT", "should-be-stripped-entry")
+        .env("CLAUDE_CODE_EXECPATH", "should-be-stripped-exec")
+        .env("CLAUDECODE", "should-be-stripped-cc")
+        .env("AI_AGENT", "should-be-stripped-agent")
+        // Spared: runtime config, not session identity — must survive.
+        .env("CLAUDE_EFFORT", "low")
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // All six session-identity vars must be absent (value empty after strip).
+    for var in &[
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDECODE",
+        "AI_AGENT",
+    ] {
+        assert!(
+            !stdout.contains(&format!("VAR_{var}=should-be-stripped")),
+            "child env should NOT contain {var} with injected value; stdout: {stdout:?}"
+        );
+        // The sentinel line is present but value is empty.
+        assert!(
+            stdout.contains(&format!("VAR_{var}=_END")),
+            "expected VAR_{var}=_END (stripped/empty) in stdout; stdout: {stdout:?}"
+        );
+    }
+
+    // Spared runtime-config var must survive.
+    assert!(
+        stdout.contains("VAR_CLAUDE_EFFORT=low_END"),
+        "CLAUDE_EFFORT should survive the strip; stdout: {stdout:?}"
+    );
+
+    // PATH must be non-empty in the child.
+    assert!(
+        stdout.contains("VAR_PATH=") && !stdout.contains("VAR_PATH=_END"),
+        "PATH should be non-empty in child env; stdout: {stdout:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (g) PTY contract: child sees a real TTY on stdout (isTTY = true)
 // ---------------------------------------------------------------------------
 
