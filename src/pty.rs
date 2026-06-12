@@ -169,6 +169,32 @@ fn spawn_pty_child(argv: &[String], cwd: &Path) -> Result<PtySpawn, PtyError> {
     }
     cmd.cwd(cwd);
 
+    // Strip parent session-identity env vars so a headless claude spawned here
+    // never inherits the launching session's identity.  This plugs the bleed
+    // vector surfaced in the CHILD_SESSION/CC-2.1.175 transcript suppression
+    // incident where Vale and groove fired EXPOSED from a live session.
+    //
+    // DELIBERATE denylist posture (not env_clear/allowlist): the child
+    // legitimately needs PATH, HOME, SOREN_HOME, and the per-agent vars that
+    // hook.rs sets.  An allowlist would be brittle as that set grows.
+    //
+    // NOT stripped: CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS,
+    // CLAUDE_STREAM_IDLE_TIMEOUT_MS, CLAUDE_EFFORT — these are
+    // feature/runtime config, not session identity.
+    //
+    // SECURITY SURFACE: denylist-vs-allowlist posture is a security judgment;
+    // Rift should ratify or override if the threat model changes.
+    for key in &[
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDECODE",
+        "AI_AGENT",
+    ] {
+        cmd.env_remove(key);
+    }
+
     let child = pair.slave.spawn_command(cmd).map_err(PtyError::Spawn)?;
 
     // Drop slave so the master sees EOF when the child exits.
