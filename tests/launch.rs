@@ -250,7 +250,7 @@ fn session_identity_vars_stripped_from_child_env() {
 // ---------------------------------------------------------------------------
 // (i) Parent env forwarding: URL-shaped var reaches child
 //
-// Exercises the explicit .envs(std::env::vars()) added to spawn_pty_child.
+// Exercises the explicit for-loop (.env() per var) added to spawn_pty_child.
 // Sets ANTHROPIC_BASE_URL on the launcher process and verifies it appears
 // in the child's environment — the specific use case that unblocks the
 // clear-thinking A/B experiment Arm B and any future proxy/env experiments.
@@ -278,7 +278,7 @@ fn proxy_url_var_forwarded_to_child() {
         .arg(check_cmd)
         .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:8780")
         // Also inject a denylist var to verify stripping still works alongside
-        // the new .envs() forwarding.
+        // the new per-var .env() forwarding loop.
         .env("CLAUDECODE", "should-be-stripped-cc")
         .output()
         .expect("failed to run heartbeat-launch");
@@ -291,10 +291,10 @@ fn proxy_url_var_forwarded_to_child() {
         "ANTHROPIC_BASE_URL should be forwarded to child; stdout: {stdout:?}"
     );
 
-    // Denylist var must still be stripped even after the explicit .envs() call.
+    // Denylist var must still be stripped even after the explicit forwarding loop.
     assert!(
         stdout.contains("VAR_CLAUDECODE=_END"),
-        "CLAUDECODE should be stripped by denylist even with .envs() forwarding; stdout: {stdout:?}"
+        "CLAUDECODE should be stripped by denylist even with per-var .env() forwarding; stdout: {stdout:?}"
     );
 }
 

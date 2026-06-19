@@ -185,7 +185,7 @@ fn spawn_pty_child(argv: &[String], cwd: &Path) -> Result<PtySpawn, PtyError> {
     //
     // The denylist env_remove() calls below still strip session-identity vars
     // from whatever the final environment contains.
-    for (key, val) in std::env::vars() {
+    for (key, val) in std::env::vars_os() {
         cmd.env(key, val);
     }
 
