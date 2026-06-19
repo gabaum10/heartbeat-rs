@@ -169,6 +169,26 @@ fn spawn_pty_child(argv: &[String], cwd: &Path) -> Result<PtySpawn, PtyError> {
     }
     cmd.cwd(cwd);
 
+    // Forward the full parent environment into the child.
+    //
+    // portable-pty's CommandBuilder::new() already calls get_base_env()
+    // internally, which captures std::env::vars_os() at construction time, so
+    // the parent env is inherited without this call. The explicit loop here
+    // re-inserts every parent var as an explicit (non-base-env) entry, making
+    // the forwarding intent visible in the source and guarding against future
+    // portable-pty behaviour changes that might alter or remove that implicit
+    // capture (e.g. a version that defaults to env-clear for sandboxing).
+    //
+    // Practical effect: vars set on the heartbeat-launch invocation — such as
+    // ANTHROPIC_BASE_URL for proxy experiments — propagate into the PTY child
+    // without needing any special wiring in the caller.
+    //
+    // The denylist env_remove() calls below still strip session-identity vars
+    // from whatever the final environment contains.
+    for (key, val) in std::env::vars() {
+        cmd.env(key, val);
+    }
+
     // Strip parent session-identity env vars so a headless claude spawned here
     // never inherits the launching session's identity.  This plugs the bleed
     // vector surfaced in the CHILD_SESSION/CC-2.1.175 transcript suppression

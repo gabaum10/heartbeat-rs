@@ -248,6 +248,57 @@ fn session_identity_vars_stripped_from_child_env() {
 }
 
 // ---------------------------------------------------------------------------
+// (i) Parent env forwarding: URL-shaped var reaches child
+//
+// Exercises the explicit .envs(std::env::vars()) added to spawn_pty_child.
+// Sets ANTHROPIC_BASE_URL on the launcher process and verifies it appears
+// in the child's environment — the specific use case that unblocks the
+// clear-thinking A/B experiment Arm B and any future proxy/env experiments.
+//
+// Also confirms the denylist env_remove() calls still fire: CLAUDECODE is
+// set on the launcher and must be absent from the child.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn proxy_url_var_forwarded_to_child() {
+    let check_cmd = r#"
+        for var in ANTHROPIC_BASE_URL CLAUDECODE; do
+            val=$(printenv "$var" 2>/dev/null || true)
+            echo "VAR_${var}=${val}_END"
+        done
+    "#;
+
+    let out = Command::new(binary())
+        .arg("--timeout")
+        .arg("10")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(check_cmd)
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:8780")
+        // Also inject a denylist var to verify stripping still works alongside
+        // the new .envs() forwarding.
+        .env("CLAUDECODE", "should-be-stripped-cc")
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // URL-shaped var must reach the child unchanged.
+    assert!(
+        stdout.contains("VAR_ANTHROPIC_BASE_URL=http://127.0.0.1:8780_END"),
+        "ANTHROPIC_BASE_URL should be forwarded to child; stdout: {stdout:?}"
+    );
+
+    // Denylist var must still be stripped even after the explicit .envs() call.
+    assert!(
+        stdout.contains("VAR_CLAUDECODE=_END"),
+        "CLAUDECODE should be stripped by denylist even with .envs() forwarding; stdout: {stdout:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (g) PTY contract: child sees a real TTY on stdout (isTTY = true)
 // ---------------------------------------------------------------------------
 
