@@ -6,6 +6,7 @@
 //! - Streams child stdout to the caller via a background thread
 //! - Polls for child exit with a configurable timeout
 //! - Detects output idle periods and injects keepalive keystrokes (not prompts) to unstick stalled sessions
+//! - Optionally tees raw child output to a per-run evidence log for post-mortem diagnosis of stalls
 //!
 //! No inbox, no settings.json, no handshake. The consumer handles all of that.
 
@@ -236,8 +237,62 @@ fn spawn_pty_child(argv: &[String], cwd: &Path) -> Result<PtySpawn, PtyError> {
 // Shared reader thread helpers
 // ---------------------------------------------------------------------------
 
-/// Spawn a basic reader thread: forwards PTY output to stdout and stamps
-/// `last_output` on every successful read.
+/// Cap on bytes written to the per-run PTY evidence log (see `open_pty_log`).
+/// This is evidence capture for post-mortem debugging of stalls, not a
+/// feature — a hard cap keeps a runaway/looping child from filling disk.
+/// 10 MiB comfortably covers a stalled session's worth of transcript at
+/// typical CLI output rates.
+const PTY_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Open a per-run PTY evidence log inside `dir`, named
+/// `heartbeat-launch-pty-<unix_millis>-<pid>.log` — timestamped and
+/// PID-suffixed so concurrent/rapid-fire runs never collide. Creates `dir` if
+/// it doesn't exist.
+///
+/// Returns `None` (rather than propagating an error) on any failure: this is
+/// best-effort evidence capture, not a feature the session's success should
+/// depend on. A warning is printed to stderr so the operator knows logging is
+/// off for this run.
+fn open_pty_log(dir: &Path) -> Option<std::fs::File> {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!(
+            "heartbeat-launch: warning: could not create PTY log dir {}: {e}",
+            dir.display()
+        );
+        return None;
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!(
+        "heartbeat-launch-pty-{millis}-{}.log",
+        std::process::id()
+    ));
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => {
+            eprintln!("heartbeat-launch: PTY output logging to {}", path.display());
+            Some(f)
+        }
+        Err(e) => {
+            eprintln!(
+                "heartbeat-launch: warning: could not open PTY log {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Spawn a basic reader thread: forwards PTY output to stdout, stamps
+/// `last_output` on every successful read, and (if `pty_log` is provided) tees
+/// the raw bytes to that file up to `PTY_LOG_MAX_BYTES` — evidence capture so
+/// a stalled/killed session is diagnosable after the fact (Tarn, W536: stalls
+/// otherwise leave no corpse).
 ///
 /// Returns the join handle plus the shared stop flag and last-output timestamp
 /// already cloned for the caller's use in the poll loop.
@@ -245,10 +300,12 @@ fn spawn_basic_reader(
     mut reader: Box<dyn Read + Send>,
     stop_reader: Arc<Mutex<bool>>,
     last_output_reader: Arc<Mutex<Instant>>,
+    mut pty_log: Option<std::fs::File>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let stdout = io::stdout();
         let mut buf = [0u8; 4096];
+        let mut log_bytes_written: u64 = 0;
         loop {
             // Check stop flag before blocking read.
             // Real shutdown comes from drop(pair.master) causing EOF on the
@@ -263,6 +320,30 @@ fn spawn_basic_reader(
                     if let Ok(mut ts) = last_output_reader.lock() {
                         *ts = Instant::now();
                     }
+
+                    // Tee to the evidence log first (best-effort, capped).
+                    // Independent of the stdout write below: a broken stdout
+                    // pipe shouldn't stop evidence capture, and a full log cap
+                    // shouldn't stop the session.
+                    if let Some(ref mut log) = pty_log {
+                        if log_bytes_written < PTY_LOG_MAX_BYTES {
+                            let remaining = (PTY_LOG_MAX_BYTES - log_bytes_written) as usize;
+                            let take = remaining.min(n);
+                            if log.write_all(&buf[..take]).is_ok() {
+                                log_bytes_written += take as u64;
+                                if log_bytes_written >= PTY_LOG_MAX_BYTES {
+                                    let _ = log.write_all(
+                                        b"\n[heartbeat-launch: PTY log cap reached, truncating]\n",
+                                    );
+                                }
+                            } else {
+                                // Log write failed (disk full, etc.) — stop
+                                // trying for the rest of the session.
+                                pty_log = None;
+                            }
+                        }
+                    }
+
                     let mut out = stdout.lock();
                     // Best-effort: if stdout is broken (consumer closed pipe), stop.
                     if out.write_all(&buf[..n]).is_err() {
@@ -332,10 +413,15 @@ fn tick_idle(
         return IdleTick::Ok;
     }
 
-    let silent_secs = last_output
+    // Snapshot the actual last-read timestamp (not just its elapsed duration)
+    // once here — the recovery branch below needs the raw value, not just how
+    // long ago it was, to tell genuine post-grace output apart from the
+    // injection's own echo.
+    let last_output_ts = last_output
         .lock()
-        .map(|ts| ts.elapsed())
-        .unwrap_or(Duration::ZERO);
+        .map(|ts| *ts)
+        .unwrap_or_else(|_| Instant::now());
+    let silent_secs = last_output_ts.elapsed();
 
     if silent_secs >= Duration::from_secs(state.timeout) {
         if state.retry_count >= state.max_retries {
@@ -377,12 +463,28 @@ fn tick_idle(
         IdleTick::KeepaliveInjected
     } else if state.retry_count > 0 {
         // Output is flowing again after a previous stall — but only credit it
-        // as genuine recovery if we are outside the grace window after the last
-        // keepalive injection. Within the grace window the output is just the
-        // PTY echoing the injected bytes back, not real recovery.
+        // as genuine recovery if the MOST RECENT recorded read (last_output_ts,
+        // snapshotted above) landed at or after the grace deadline. This is
+        // deliberately NOT `last_keepalive.elapsed() >= GRACE` (wall-clock
+        // "now" vs. the keepalive time) — that check is a pure function of
+        // how long the poll loop has been running and goes true regardless of
+        // whether the child ever produced another byte, which is the W536
+        // defect: since GRACE (20s) < any realistic idle timeout, it silently
+        // zeroed the retry counter every cycle and made `IdleTick::Exhausted`
+        // unreachable.
+        //
+        // The injection branch above resets `last_output` to `Instant::now()`
+        // at the moment of injection, so if the child produces nothing more
+        // than the injection's own echo (which lands within a tick or two and
+        // is well inside the grace window), `last_output_ts` never advances
+        // past the deadline and this check correctly stays false forever —
+        // the outer branch's silent_secs will grow again and drive the next
+        // real retry after a full idle_timeout of continued silence. Only an
+        // actual read that lands at or after the deadline (genuine output
+        // continuing past the echo-settling window) satisfies it.
         let past_grace = state
             .last_keepalive
-            .map(|t| t.elapsed() >= Duration::from_secs(KEEPALIVE_GRACE_SECS))
+            .map(|kt| last_output_ts >= kt + Duration::from_secs(KEEPALIVE_GRACE_SECS))
             .unwrap_or(true);
         if past_grace {
             eprintln!(
@@ -418,12 +520,19 @@ fn tick_idle(
 /// the PTY produces no output for that many seconds, ESC-ESC followed by
 /// the `idle` keepalive text and a carriage return is sent to unstick a stalled session. After
 /// `idle.max_retries` injections without recovery, the child is killed.
+///
+/// `pty_log_dir` — optional directory for a per-run evidence log of the raw
+/// PTY child output (tee'd alongside the normal stdout stream, capped at
+/// `PTY_LOG_MAX_BYTES`). Disabled when `None` (the default: this is opt-in
+/// evidence capture, not on-by-default behaviour). Naming and enabling this is
+/// the caller's concern — e.g. Fen's triage harness passes its own log dir.
 pub fn run(
     argv: &[String],
     cwd: &Path,
     timeout_secs: u64,
     exit_signal: Option<&Path>,
     idle: Option<&IdleConfig>,
+    pty_log_dir: Option<&Path>,
 ) -> Result<RunResult, PtyError> {
     let PtySpawn {
         master,
@@ -439,7 +548,9 @@ pub fn run(
     // The poll loop reads it to detect idle periods.
     let last_output: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
-    let reader_thread = spawn_basic_reader(reader, Arc::clone(&stop), Arc::clone(&last_output));
+    let pty_log = pty_log_dir.and_then(open_pty_log);
+    let reader_thread =
+        spawn_basic_reader(reader, Arc::clone(&stop), Arc::clone(&last_output), pty_log);
 
     // Delete any stale signal file left over from a previous crash before
     // entering the poll loop. Without this, a file orphaned by a prior
@@ -624,6 +735,7 @@ mod tests {
             10,
             None,
             None,
+            None,
         )
         .expect("run should succeed");
         assert_eq!(result.exit_code, 0, "echo should exit 0");
@@ -635,7 +747,7 @@ mod tests {
     fn nonzero_exit_code_propagated() {
         // `false` always exits 1.
         let result =
-            run(&["false".to_string()], &tmp(), 10, None, None).expect("run should succeed");
+            run(&["false".to_string()], &tmp(), 10, None, None, None).expect("run should succeed");
         assert_ne!(result.exit_code, 0, "false should exit non-zero");
     }
 
@@ -648,6 +760,7 @@ mod tests {
             &["sleep".to_string(), "60".to_string()],
             &tmp(),
             1,
+            None,
             None,
             None,
         )
@@ -691,6 +804,7 @@ mod tests {
             &tmp(),
             10, // generous timeout so the test doesn't hang on slow CI
             Some(&signal_path),
+            None,
             None,
         )
         .expect("run should succeed");
@@ -750,6 +864,34 @@ mod tests {
         );
     }
 
+    /// Companion to the regression test above: genuine output that lands AT
+    /// OR AFTER the grace deadline must still be credited as real recovery.
+    /// The fix must close the false-positive hole without also disabling the
+    /// legitimate recovery path.
+    #[test]
+    fn idle_recovery_credited_for_genuine_post_grace_output() {
+        let mut state = IdleState {
+            timeout: 1000,
+            prompt: "Continue".to_string(),
+            max_retries: 3,
+            retry_count: 1,
+            last_keepalive: Some(Instant::now() - Duration::from_secs(25)),
+        };
+        // A real read landed 3s ago — after the 20s grace deadline relative
+        // to the keepalive sent 25s ago (deadline was at "25s ago + 20s" =
+        // "5s ago").
+        let last_output = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3)));
+        let mut writer: Option<Box<dyn Write + Send>> = None;
+
+        let tick = tick_idle(&mut state, &last_output, &mut writer);
+
+        assert_eq!(
+            state.retry_count, 0,
+            "genuine output past the grace deadline must reset the retry counter"
+        );
+        assert!(matches!(tick, IdleTick::Recovered));
+    }
+
     /// Stale signal file at startup: a pre-existing signal file is deleted
     /// before the poll loop begins, preventing orphan-file poisoning where a
     /// crash on a previous run leaves the file behind and the next invocation
@@ -776,6 +918,7 @@ mod tests {
             &tmp(),
             10,
             Some(&signal_path),
+            None,
             None,
         )
         .expect("run should succeed");

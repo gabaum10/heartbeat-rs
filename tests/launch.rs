@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use tempfile::TempDir;
 
 fn binary() -> PathBuf {
     std::env::var("CARGO_BIN_EXE_heartbeat-launch")
@@ -317,5 +318,54 @@ fn tty_is_allocated() {
         stdout.trim(),
         "tty",
         "expected stdout to be exactly 'tty' (child should see a TTY), got: {stdout:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (h) --pty-log-dir: PTY evidence log (Tarn, W536 defect 2 — stalled sessions
+// left no corpse). A per-run log file should appear in the given directory
+// and contain the child's raw output.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn pty_log_dir_captures_child_output() {
+    let log_dir = TempDir::new().expect("create temp log dir");
+
+    let out = Command::new(binary())
+        .arg("--timeout")
+        .arg("10")
+        .arg("--pty-log-dir")
+        .arg(log_dir.path())
+        .arg("--")
+        .arg("echo")
+        .arg("hello-from-pty-log")
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    assert_eq!(out.status.code(), Some(0));
+
+    let entries: Vec<_> = std::fs::read_dir(log_dir.path())
+        .expect("read log dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one PTY log file, found: {:?}",
+        entries.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+
+    let log_path = entries[0].path();
+    let name = log_path.file_name().unwrap().to_string_lossy().to_string();
+    assert!(
+        name.starts_with("heartbeat-launch-pty-") && name.ends_with(".log"),
+        "unexpected log file name: {name}"
+    );
+
+    let contents = std::fs::read_to_string(&log_path).expect("read PTY log");
+    assert!(
+        contents.contains("hello-from-pty-log"),
+        "PTY log should contain the child's output, got: {contents:?}"
     );
 }

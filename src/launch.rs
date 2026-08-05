@@ -71,6 +71,17 @@ struct Cli {
     #[arg(long, default_value = "3")]
     max_idle_retries: u32,
 
+    /// Optional directory for a per-run evidence log of raw PTY child output.
+    ///
+    /// When set, the child's output is tee'd (in addition to the normal
+    /// stdout stream) to a timestamped file inside this directory:
+    /// `heartbeat-launch-pty-<unix_millis>-<pid>.log`, capped at 10 MiB. This
+    /// makes a stalled or killed session diagnosable after the fact. Disabled
+    /// by default — opt in by pointing this at wherever your harness keeps
+    /// logs.
+    #[arg(long)]
+    pty_log_dir: Option<PathBuf>,
+
     /// Command and arguments to run inside the PTY.
     /// Pass everything after `--`.
     #[arg(trailing_var_arg = true, required = true)]
@@ -136,6 +147,7 @@ fn main() {
         cli.timeout,
         cli.exit_signal.as_deref(),
         idle_cfg.as_ref(),
+        cli.pty_log_dir.as_deref(),
     );
 
     match result {
