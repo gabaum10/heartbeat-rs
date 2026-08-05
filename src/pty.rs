@@ -708,6 +708,48 @@ mod tests {
         );
     }
 
+    /// Regression test for the dead-`--max-idle-retries` defect (Tarn, W536).
+    ///
+    /// `tick_idle`'s recovery branch must only credit `IdleTick::Recovered`
+    /// (and reset `retry_count`) when a GENUINE read landed after the grace
+    /// deadline — not merely because wall-clock time has passed since the
+    /// keepalive was sent. The pre-fix implementation checked
+    /// `last_keepalive.elapsed() >= KEEPALIVE_GRACE_SECS`, which is a function
+    /// of `Instant::now()` alone and becomes true regardless of whether the
+    /// child ever produced another byte. Since `KEEPALIVE_GRACE_SECS` (20) is
+    /// always less than any realistic idle timeout, this silently reset the
+    /// counter on every cycle, making `IdleTick::Exhausted` unreachable.
+    ///
+    /// This test simulates: a keepalive was sent 25s ago (past grace), the
+    /// PTY's last recorded read is 24s ago — i.e. only the injection's own
+    /// echo landed, one tick after injection, and nothing since. No real
+    /// child output ever arrived. The counter must NOT reset.
+    #[test]
+    fn idle_recovery_requires_genuine_output_past_grace() {
+        let mut state = IdleState {
+            timeout: 1000, // large: keeps us in the recovery-check branch, not the trigger branch
+            prompt: "Continue".to_string(),
+            max_retries: 3,
+            retry_count: 1, // one keepalive already sent this cycle
+            last_keepalive: Some(Instant::now() - Duration::from_secs(25)),
+        };
+        // Only the echo of the injected bytes arrived, shortly after
+        // injection — well within the grace window, and nothing since.
+        let last_output = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(24)));
+        let mut writer: Option<Box<dyn Write + Send>> = None;
+
+        let tick = tick_idle(&mut state, &last_output, &mut writer);
+
+        assert_eq!(
+            state.retry_count, 1,
+            "retry counter must not reset without a genuine read past the grace deadline"
+        );
+        assert!(
+            !matches!(tick, IdleTick::Recovered),
+            "must not report Recovered without genuine post-grace output"
+        );
+    }
+
     /// Stale signal file at startup: a pre-existing signal file is deleted
     /// before the poll loop begins, preventing orphan-file poisoning where a
     /// crash on a previous run leaves the file behind and the next invocation
