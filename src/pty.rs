@@ -1199,4 +1199,62 @@ mod tests {
             "the active file specifically must hold the very latest write, got: {active:?}"
         );
     }
+
+    /// Regression test for Lens's NOTABLE finding on PR #15 (W536 round 3):
+    /// when `rotate()`'s rename fails, `bytes_written` is never reset, so
+    /// every subsequent `write()` calls `rotate()` again, which retries the
+    /// same doomed rename forever — one failing syscall per read on the
+    /// drain thread — while the active file grows without bound, silently
+    /// voiding the disk-fill guard `PTY_LOG_MAX_BYTES`/`cap_half` is supposed
+    /// to provide.
+    ///
+    /// Reproduces Lens's method: chmod the log directory read-only after
+    /// opening, so `rename` (which needs write permission on the containing
+    /// directory to move an entry out of it) fails with EACCES while the
+    /// already-open file descriptor stays valid and further writes keep
+    /// succeeding.
+    ///
+    /// Expected to FAIL against the current `rotate()`: the loop below
+    /// writes 200 * 16 = 3200 bytes against a 64-byte `cap_half`, and the
+    /// active file's size should track all of it once rotation is broken.
+    #[cfg(unix)]
+    #[test]
+    fn ring_log_stops_growing_when_rotation_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("create temp dir");
+        let mut log = RingLog::open_with_cap_half(dir.path(), 64).expect("open ring log");
+
+        // Remove write permission on the log directory so the rename inside
+        // rotate() fails with EACCES. The already-open fd on the active file
+        // stays valid; only future directory-entry operations (rename,
+        // create) are blocked.
+        let mut perms = std::fs::metadata(dir.path())
+            .expect("stat log dir")
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod log dir read-only");
+
+        // Write well past cap_half in a loop. Every write should succeed
+        // (writing must never surface the rotation failure as an error to
+        // the caller), but the active file must not grow without bound.
+        for _ in 0..200 {
+            log.write(b"0123456789012345")
+                .expect("write must not error even when rotation is broken");
+        }
+
+        // Restore permissions before reading metadata / TempDir cleanup —
+        // otherwise TempDir's own Drop can fail to remove a read-only dir.
+        let restore = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(dir.path(), restore).expect("restore log dir perms for cleanup");
+
+        let size = std::fs::metadata(&log.path)
+            .expect("stat active log file")
+            .len();
+        assert!(
+            size <= 64,
+            "the cap must hold even when rotation fails — active file grew to \
+             {size} bytes against cap_half=64 (wrote 3200 bytes total)"
+        );
+    }
 }
