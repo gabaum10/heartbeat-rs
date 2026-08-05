@@ -240,10 +240,13 @@ fn spawn_pty_child(argv: &[String], cwd: &Path) -> Result<PtySpawn, PtyError> {
 /// Cap on total bytes retained across the per-run PTY evidence log's two
 /// files (see `RingLog`). This is evidence capture for post-mortem debugging
 /// of stalls, not a feature — the cap keeps a runaway/looping child from
-/// filling disk. `PTY_LOG_MAX_BYTES` (10 MiB) comfortably covers a stalled
-/// session's worth of transcript at typical CLI output rates. Referenced from
-/// the `--pty-log-dir` flag help (src/launch.rs) and this module's doc
-/// comments — update prose at both sites if this changes materially.
+/// filling disk. 10 MiB comfortably covers a stalled session's worth of
+/// transcript at typical CLI output rates.
+///
+/// The `--pty-log-dir` flag help in src/launch.rs states this same figure in
+/// user-facing prose ("10 MiB") rather than naming this const — `--help`
+/// output shouldn't point a reader at a private source-file identifier they
+/// can't see. Update both prose sites if this value changes materially.
 const PTY_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 /// A size-bounded PTY evidence log that rotates instead of truncating, so the
@@ -263,20 +266,30 @@ const PTY_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// before) and a fresh active file is opened. Reading `<path>.1` followed by
 /// `<path>` reconstructs up to `PTY_LOG_MAX_BYTES` of the most recent output
 /// — the *head* of the oldest retained chunk is what eventually gets
-/// dropped, not the tail.
+/// dropped, not the tail. Immediately after a rotation, before the next one,
+/// retention floors at `cap_half` (the `.1` file alone) rather than the full
+/// cap — the second file only reaches its own half once it fills.
 struct RingLog {
     path: std::path::PathBuf,
     rotated_path: std::path::PathBuf,
     file: std::fs::File,
     bytes_written: u64,
     cap_half: u64,
+    /// Set once a rotation attempt fails (rename or reopen). After that,
+    /// `write` stops appending entirely — see `rotate`'s doc for why.
+    rotation_failed: bool,
 }
 
 impl RingLog {
     /// Open a per-run PTY evidence log inside `dir`, named
     /// `heartbeat-launch-pty-<unix_millis>-<pid>.log` — timestamped and
-    /// PID-suffixed so concurrent/rapid-fire runs never collide. Creates
-    /// `dir` if it doesn't exist.
+    /// PID-suffixed so concurrent/rapid-fire runs across DIFFERENT processes
+    /// never collide. Within a single process, two `run()` calls opening a
+    /// log in the same millisecond would share a path — vanishingly unlikely
+    /// (library consumers only; the binary makes one `run()` call) and, if it
+    /// ever happened, the second `open` truncates the first (see the
+    /// `.truncate(true)` below, needed for rotation to work). Creates `dir`
+    /// if it doesn't exist.
     ///
     /// Returns `None` (rather than propagating an error) on any failure:
     /// this is best-effort evidence capture, not a feature the session's
@@ -329,6 +342,7 @@ impl RingLog {
                     file,
                     bytes_written: 0,
                     cap_half,
+                    rotation_failed: false,
                 })
             }
             Err(e) => {
@@ -344,7 +358,18 @@ impl RingLog {
     /// Write `data`, rotating once the active file passes half the cap.
     /// Returns `Err` on unrecoverable write failure (e.g. disk full) so the
     /// caller can stop trying for the rest of the run.
+    ///
+    /// Once `rotation_failed` is set (see `rotate`), this stops appending
+    /// entirely rather than retrying a doomed rename on every call — the cap
+    /// guarantee holds (degraded to whatever was captured before the
+    /// failure) instead of the file growing unbounded (Lens, W536 round 3:
+    /// measured 12800 bytes into a 64-byte cap_half with the previous
+    /// early-return-only handling, plus one failing rename syscall per read
+    /// on this thread, forever).
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.rotation_failed {
+            return Ok(());
+        }
         self.file.write_all(data)?;
         self.bytes_written += data.len() as u64;
         if self.bytes_written >= self.cap_half {
@@ -355,13 +380,26 @@ impl RingLog {
 
     /// Move the filled active file to the `.1` path and start a fresh one.
     ///
-    /// Best-effort: if the rename or reopen fails (e.g. a platform that
-    /// disallows renaming an open file), keep writing into the current file
-    /// past `cap_half` rather than losing data outright — this degrades to
-    /// "one oversized recent chunk" instead of losing the tail, which is
-    /// still strictly better than the head-only cap this replaces.
+    /// If either the rename or the reopen fails (a non-writable log
+    /// directory — chmod, a mount flipping read-only, a MAC policy — is the
+    /// realistic case; a platform that disallows renaming an open file is a
+    /// theoretical one), sets `rotation_failed` and logs a one-time warning
+    /// rather than leaving `bytes_written` above `cap_half`. Retrying the
+    /// same doomed rename on every subsequent write would fail a syscall on
+    /// every read forever and let the file grow without bound — silently
+    /// voiding the disk-fill guard this whole struct exists to provide.
+    /// Stopping here degrades to round 1's head-only cap (whatever was
+    /// captured before the failure, nothing more appended), which keeps the
+    /// guarantee true instead of just smaller.
     fn rotate(&mut self) {
         if std::fs::rename(&self.path, &self.rotated_path).is_err() {
+            eprintln!(
+                "heartbeat-launch: warning: PTY log rotation failed for {} — \
+                 evidence capture stops here for the rest of this run \
+                 (cap held at its current, head-only size rather than growing unbounded)",
+                self.path.display()
+            );
+            self.rotation_failed = true;
             return;
         }
         match std::fs::OpenOptions::new()
@@ -374,15 +412,13 @@ impl RingLog {
                 self.file = f;
                 self.bytes_written = 0;
             }
-            Err(_) => {
-                // Couldn't reopen the active path after rotating — fall back
-                // to appending to the rotated file so we keep a live fd.
-                if let Ok(f) = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&self.rotated_path)
-                {
-                    self.file = f;
-                }
+            Err(e) => {
+                eprintln!(
+                    "heartbeat-launch: warning: could not reopen PTY log {} after rotation — \
+                     evidence capture stops here for the rest of this run: {e}",
+                    self.path.display()
+                );
+                self.rotation_failed = true;
             }
         }
     }
