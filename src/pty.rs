@@ -892,6 +892,50 @@ mod tests {
         assert!(matches!(tick, IdleTick::Recovered));
     }
 
+    /// Regression test for Lens's IMPORTANT finding on PR #15 (W536 round 2):
+    /// `KEEPALIVE_GRACE_SECS` (20s) does double duty as both an echo-settle
+    /// filter and, unintentionally, a "the child must still be producing
+    /// output this many seconds after the keepalive" bar. A genuine reply
+    /// that streams output and then legitimately goes quiet again — but
+    /// finishes streaming before the 20s mark — is never credited as
+    /// recovery under the current comparison. Lens measured this directly: a
+    /// session whose keepalive worked every time (response ran injection+0s
+    /// to injection+8s) still reached `IdleExhausted` and got SIGKILLed after
+    /// enough idle cycles, with every keepalive having actually worked.
+    ///
+    /// This test simulates exactly that: a keepalive was sent 25s ago, and
+    /// the last genuine read landed at injection+8s (17s ago) — well past
+    /// the echo settling (which lands within ~50ms of injection), but well
+    /// short of the 20s grace mark this comparison currently requires.
+    ///
+    /// Expected to FAIL against the current `KEEPALIVE_GRACE_SECS = 20`
+    /// comparison: deadline is 25s-ago + 20s = 5s-ago, and 17s-ago is not
+    /// `>= 5s-ago`.
+    #[test]
+    fn idle_recovery_credited_for_response_shorter_than_old_grace_window() {
+        let mut state = IdleState {
+            timeout: 1000,
+            prompt: "Continue".to_string(),
+            max_retries: 3,
+            retry_count: 1,
+            last_keepalive: Some(Instant::now() - Duration::from_secs(25)),
+        };
+        // Genuine response streamed from injection to roughly injection+8s,
+        // then the session went quiet again — a normal, healthy short reply.
+        let last_output = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(17)));
+        let mut writer: Option<Box<dyn Write + Send>> = None;
+
+        let tick = tick_idle(&mut state, &last_output, &mut writer);
+
+        assert_eq!(
+            state.retry_count, 0,
+            "a genuine reply that streamed past echo-settle, even if it ended \
+             well before the 20s grace mark, must be credited as recovery — \
+             a healthy session must not be driven toward IdleExhausted"
+        );
+        assert!(matches!(tick, IdleTick::Recovered));
+    }
+
     /// Stale signal file at startup: a pre-existing signal file is deleted
     /// before the poll loop begins, preventing orphan-file poisoning where a
     /// crash on a previous run leaves the file behind and the next invocation
