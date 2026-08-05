@@ -97,6 +97,7 @@ heartbeat-launch --timeout 0 -- claude "Read CLAUDE.md"
 |------|---------|-------------|
 | `--cwd <dir>` | `.` | Working directory for the child process. |
 | `--timeout <secs>` | `3600` | Seconds before the child is killed (SIGKILL). `0` means no timeout. |
+| `--pty-log-dir <dir>` | none (disabled) | Tee raw PTY child output to a timestamped, rotating evidence log inside `<dir>` -- makes a stalled or killed session diagnosable after the fact. Opt-in. |
 
 Exit codes mirror the child process. Timeout exits with code `124` (same convention as `timeout(1)` on Linux).
 

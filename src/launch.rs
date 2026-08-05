@@ -75,7 +75,9 @@ struct Cli {
     ///
     /// When set, the child's output is tee'd (in addition to the normal
     /// stdout stream) to a timestamped file inside this directory:
-    /// `heartbeat-launch-pty-<unix_millis>-<pid>.log`, capped at 10 MiB. This
+    /// `heartbeat-launch-pty-<unix_millis>-<pid>.log`. Capped at
+    /// `PTY_LOG_MAX_BYTES` (10 MiB, see `pty.rs`) across two rotating files so
+    /// the MOST RECENT output survives the cap rather than the oldest. This
     /// makes a stalled or killed session diagnosable after the fact. Disabled
     /// by default — opt in by pointing this at wherever your harness keeps
     /// logs.
