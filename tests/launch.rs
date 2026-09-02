@@ -71,6 +71,37 @@ fn exit_code_forwarded() {
 }
 
 // ---------------------------------------------------------------------------
+// (b2) exit codes above 123 survive unclamped
+//
+// Regression guard for the removal of the `.min(123)` clamp: a child that
+// exits with a code above the old reservation band (124-127) must have that
+// exact value forwarded, not saturated. `sh -c 'exit 200'` is a value that
+// only a clamp would touch — a bug that reintroduces `.min(123)` turns this
+// green-under-fix test red.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn exit_code_above_123_survives_unclamped() {
+    let out = Command::new(binary())
+        .arg("--timeout")
+        .arg("10")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg("exit 200")
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    assert_eq!(
+        out.status.code(),
+        Some(200),
+        "exit code 200 should survive unclamped, got: {:?}",
+        out.status.code()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (c) --cwd sets working directory; `pwd` output matches
 // ---------------------------------------------------------------------------
 

@@ -140,12 +140,48 @@ fn main() {
 
     match result {
         Ok(result) => {
-            // Cap exit code at 123 to avoid colliding with 124 (Timeout),
-            // 125 (IdleExhausted), and the signal-death range (126-127 on
-            // POSIX shells).  Values above 123 from a process exit() call are
-            // technically valid but unusual; saturation avoids silent i32
-            // wrapping on values that exceed i32::MAX (portable-pty: u32).
-            let code = result.exit_code.min(123) as i32;
+            // Forward the child's real exit code unflattened. Reserving a
+            // numeric band (the old 123 clamp) can't actually separate
+            // heartbeat's own outcomes from the child's: the child is free
+            // to exit with any code in that same space (e.g. a script that
+            // legitimately exits 124), so a code-based reservation was
+            // never sound — only ever approximate. What *is* sound: every
+            // heartbeat-decided outcome (Timeout, IdleExhausted, the
+            // generic Err arm below) already writes a distinct
+            // heartbeat-authored stderr line before it exits. A plain
+            // forward here does the same, so presence/absence of a
+            // "heartbeat-launch:" stderr line — not the numeric value —
+            // is what tells a reader which kind of exit they're looking
+            // at. The forwarded value is the child's real code EXCEPT on
+            // the `--exit-signal` path, where pty.rs synthesizes 0 once
+            // the exit signal has been sent, regardless of how the child
+            // actually died.
+            //
+            // u32 -> i32: exit_code is portable-pty's u32. On Unix, a
+            // child that exits normally has already been through the
+            // kernel's own truncation to 0..=255 before we ever see it
+            // (portable-pty's `ExitStatus::from<std::process::ExitStatus>`
+            // reads `status.code()`, which is `Some` only for a normal
+            // exit and truncated via WEXITSTATUS in that case). A child
+            // that dies by signal has no WEXITSTATUS value at all —
+            // `status.code()` is `None`, and portable-pty maps that to a
+            // literal 1 (`unwrap_or(1)`), not a kernel-truncated code. So
+            // this channel cannot distinguish "child exited 1" from
+            // "child was killed by a signal"; both arrive here as 1. On
+            // Windows exit_code is GetExitCodeProcess's raw DWORD and can
+            // exceed i32::MAX; try_from surfaces that instead of silently
+            // wrapping it.
+            let code = match i32::try_from(result.exit_code) {
+                Ok(code) => code,
+                Err(_) => {
+                    eprintln!(
+                        "heartbeat-launch: child exit code {} exceeds i32::MAX, capping to i32::MAX",
+                        result.exit_code
+                    );
+                    i32::MAX
+                }
+            };
+            eprintln!("heartbeat-launch: child exited with code {code}");
             process::exit(code);
         }
         Err(pty::PtyError::Timeout(secs)) => {
