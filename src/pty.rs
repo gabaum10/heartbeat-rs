@@ -848,4 +848,119 @@ mod tests {
         ));
         assert_eq!(state.retry_count, 2);
     }
+
+    /// Output stamped exactly at the end of the grace window counts as
+    /// recovery; output one millisecond earlier does not.
+    #[test]
+    fn idle_output_exactly_at_grace_edge_resets_counter() {
+        let mut state = idle_state(30, 3);
+        let t0 = Instant::now();
+        let injected = t0 + secs(30);
+        assert!(matches!(
+            tick_idle(&mut state, t0, injected, &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+
+        let edge = injected + secs(KEEPALIVE_GRACE_SECS);
+        let just_before = edge - Duration::from_millis(1);
+        assert!(matches!(
+            tick_idle(&mut state, just_before, edge, &mut None),
+            IdleTick::Ok
+        ));
+        assert_eq!(state.retry_count, 1);
+
+        assert!(matches!(
+            tick_idle(&mut state, edge, edge, &mut None),
+            IdleTick::Recovered
+        ));
+        assert_eq!(state.retry_count, 0);
+    }
+
+    /// Output stamped at the same instant as the injection is echo, not
+    /// recovery, even once wall-clock time is past the grace window.
+    #[test]
+    fn idle_output_at_injection_instant_is_not_recovery() {
+        let mut state = idle_state(30, 3);
+        let t0 = Instant::now();
+        let injected = t0 + secs(30);
+        assert!(matches!(
+            tick_idle(&mut state, t0, injected, &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+
+        for s in 0..30 {
+            assert!(
+                matches!(
+                    tick_idle(&mut state, injected, injected + secs(s), &mut None),
+                    IdleTick::Ok
+                ),
+                "output at the injection instant must not count as recovery at +{s}s"
+            );
+        }
+        assert_eq!(state.retry_count, 1);
+        assert!(matches!(
+            tick_idle(&mut state, injected, injected + secs(30), &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        assert_eq!(state.retry_count, 2);
+    }
+
+    /// With max_retries of 0 the first idle tick exhausts without injecting.
+    #[test]
+    fn idle_zero_max_retries_exhausts_without_injecting() {
+        let mut state = idle_state(30, 0);
+        let t0 = Instant::now();
+        assert!(matches!(
+            tick_idle(&mut state, t0, t0 + secs(29), &mut None),
+            IdleTick::Ok
+        ));
+        assert!(matches!(
+            tick_idle(&mut state, t0, t0 + secs(30), &mut None),
+            IdleTick::Exhausted
+        ));
+        assert_eq!(state.retry_count, 0);
+        assert!(state.last_keepalive.is_none());
+    }
+
+    /// With the idle timeout below the grace window, output that keeps silence
+    /// under the timeout is not credited until the grace window has passed,
+    /// and output that stops short of it leads to another injection.
+    #[test]
+    fn idle_timeout_below_grace_window() {
+        let t0 = Instant::now();
+
+        // Sustained output: credited at the first output past grace.
+        let mut state = idle_state(10, 3);
+        let injected = t0 + secs(10);
+        assert!(matches!(
+            tick_idle(&mut state, t0, injected, &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        for s in [5, 10, 15] {
+            let out = injected + secs(s);
+            assert!(matches!(
+                tick_idle(&mut state, out, out, &mut None),
+                IdleTick::Ok
+            ));
+        }
+        let out = injected + secs(KEEPALIVE_GRACE_SECS);
+        assert!(matches!(
+            tick_idle(&mut state, out, out, &mut None),
+            IdleTick::Recovered
+        ));
+
+        // One burst inside grace, then silence for a full timeout: the burst
+        // is not credited and the next keepalive fires.
+        let mut state = idle_state(10, 3);
+        assert!(matches!(
+            tick_idle(&mut state, t0, injected, &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        let burst = injected + secs(12);
+        assert!(matches!(
+            tick_idle(&mut state, burst, burst + secs(10), &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        assert_eq!(state.retry_count, 2);
+    }
 }

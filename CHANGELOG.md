@@ -9,9 +9,10 @@ All notable changes to this project will be documented in this file.
 - Idle watchdog in `heartbeat-launch` (`src/pty.rs`) can exhaust again. A
   keepalive injection used to overwrite the reader's last-output timestamp, so
   once the grace window passed the retry counter reset with no real output and
-  the maximum idle retries was never reached. Injections are now tracked separately,
-  silence is measured from the later of real output and the last injection, and
-  the counter resets only when output arrives after the injection's grace window.
+  the maximum idle retries was never reached. Injections are now tracked
+  separately, silence is measured from the later of real output and the last
+  injection, and the counter resets only when output arrives after the
+  injection's grace window.
 
 ## [0.5.0] - 2026-05-31
 
