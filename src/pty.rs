@@ -323,19 +323,26 @@ enum IdleTick {
 /// Returns `IdleTick::Ok` immediately when idle detection is disabled
 /// (`state.timeout == 0`). Otherwise it checks how long the PTY has been silent
 /// and injects a keepalive, reports recovery, or reports exhaustion accordingly.
+///
+/// `last_output` is when the reader thread last saw PTY output and `now` is
+/// the current time; both are passed in so the tick can be driven by tests.
+/// Silence is measured from the later of the last output and the last
+/// keepalive injection, so an injection restarts the idle timer without
+/// counting as output.
 fn tick_idle(
     state: &mut IdleState,
-    last_output: &Arc<Mutex<Instant>>,
+    last_output: Instant,
+    now: Instant,
     pty_writer: &mut Option<Box<dyn Write + Send>>,
 ) -> IdleTick {
     if state.timeout == 0 {
         return IdleTick::Ok;
     }
 
-    let silent_secs = last_output
-        .lock()
-        .map(|ts| ts.elapsed())
-        .unwrap_or(Duration::ZERO);
+    let last_activity = state
+        .last_keepalive
+        .map_or(last_output, |k| k.max(last_output));
+    let silent_secs = now.saturating_duration_since(last_activity);
 
     if silent_secs >= Duration::from_secs(state.timeout) {
         if state.retry_count >= state.max_retries {
@@ -364,26 +371,22 @@ fn tick_idle(
             let _ = w.flush();
         }
 
-        // Record when we last injected so the grace period below
-        // can suppress the echo-triggered counter reset.
-        state.last_keepalive = Some(Instant::now());
-
-        // Reset the activity timestamp so the idle timer restarts
-        // from now rather than immediately firing again.
-        if let Ok(mut ts) = last_output.lock() {
-            *ts = Instant::now();
-        }
+        // Record when we injected. This restarts the idle timer (silence is
+        // measured from the later of output and injection) without touching
+        // the reader's output timestamp: overwriting that made the injection
+        // itself look like resumed output, so the retry counter reset on
+        // every cycle and never reached exhaustion.
+        state.last_keepalive = Some(now);
 
         IdleTick::KeepaliveInjected
     } else if state.retry_count > 0 {
-        // Output is flowing again after a previous stall — but only credit it
-        // as genuine recovery if we are outside the grace window after the last
-        // keepalive injection. Within the grace window the output is just the
-        // PTY echoing the injected bytes back, not real recovery.
+        // Only credit genuine recovery: the reader must have seen output after
+        // the grace window following the last injection. Output inside the
+        // grace window is the PTY echoing the injected bytes back, and the
+        // mere passage of time without output is not recovery at all.
         let past_grace = state
             .last_keepalive
-            .map(|t| t.elapsed() >= Duration::from_secs(KEEPALIVE_GRACE_SECS))
-            .unwrap_or(true);
+            .is_none_or(|k| last_output >= k + Duration::from_secs(KEEPALIVE_GRACE_SECS));
         if past_grace {
             eprintln!(
                 "heartbeat-launch: output resumed — resetting idle retry counter (was {})",
@@ -567,8 +570,10 @@ pub fn run(
                 // idle_timeout, inject ESC + keepalive prompt to unstick the
                 // stalled generation. After max_idle_retries injections without
                 // recovery, give up and kill the child.
+                let now = Instant::now();
+                let last_output_at = last_output.lock().map(|ts| *ts).unwrap_or(now);
                 if let IdleTick::Exhausted =
-                    tick_idle(&mut idle_state, &last_output, &mut pty_writer)
+                    tick_idle(&mut idle_state, last_output_at, now, &mut pty_writer)
                 {
                     eprintln!(
                         "heartbeat-launch: idle timeout fired {} time(s) without recovery — killing child",
@@ -743,5 +748,219 @@ mod tests {
             !signal_path.exists(),
             "stale signal file should be deleted by run() before poll loop"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Idle tick, driven with synthetic clock values (no PTY, no sleeping).
+    // -----------------------------------------------------------------------
+
+    fn idle_state(timeout_secs: u64, max_retries: u32) -> IdleState {
+        IdleState::from_config(Some(&IdleConfig {
+            timeout_secs,
+            prompt: "Continue".to_string(),
+            max_retries,
+        }))
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// Keepalives injected with no real output afterwards reach exhaustion
+    /// after the maximum retries. Regression: an injection used to stamp the
+    /// output timestamp, so past the grace window the counter reset with no
+    /// output and the watchdog never exhausted.
+    #[test]
+    fn idle_keepalives_without_output_exhaust() {
+        let mut state = idle_state(30, 3);
+        let t0 = Instant::now();
+        let mut injections = 0;
+        let mut exhausted_at = None;
+        for s in 0..=600 {
+            match tick_idle(&mut state, t0, t0 + secs(s), &mut None) {
+                IdleTick::KeepaliveInjected => injections += 1,
+                IdleTick::Recovered => panic!("counter reset with no real output at +{s}s"),
+                IdleTick::Exhausted => {
+                    exhausted_at = Some(s);
+                    break;
+                }
+                IdleTick::Ok => {}
+            }
+        }
+        assert_eq!(injections, 3, "one injection per retry");
+        assert_eq!(state.retry_count, 3);
+        assert_eq!(
+            exhausted_at,
+            Some(120),
+            "exhausts one timeout after the last injection"
+        );
+    }
+
+    /// Real output arriving after the grace window resets the retry counter.
+    #[test]
+    fn idle_real_output_after_grace_resets_counter() {
+        let mut state = idle_state(30, 3);
+        let t0 = Instant::now();
+        assert!(matches!(
+            tick_idle(&mut state, t0, t0 + secs(30), &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        assert_eq!(state.retry_count, 1);
+
+        let output = t0 + secs(30 + KEEPALIVE_GRACE_SECS + 1);
+        assert!(matches!(
+            tick_idle(&mut state, output, output, &mut None),
+            IdleTick::Recovered
+        ));
+        assert_eq!(state.retry_count, 0);
+        assert!(state.last_keepalive.is_none());
+    }
+
+    /// The PTY echoing the injected keepalive inside the grace window does not
+    /// reset the counter, even once wall-clock time is past the grace window.
+    #[test]
+    fn idle_echo_inside_grace_does_not_reset_counter() {
+        let mut state = idle_state(30, 3);
+        let t0 = Instant::now();
+        let injected = t0 + secs(30);
+        assert!(matches!(
+            tick_idle(&mut state, t0, injected, &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+
+        let echo = injected + secs(1);
+        for s in 1..=30 {
+            assert!(
+                matches!(
+                    tick_idle(&mut state, echo, injected + secs(s), &mut None),
+                    IdleTick::Ok
+                ),
+                "echo inside grace must not count as recovery at +{s}s after injection"
+            );
+            assert_eq!(state.retry_count, 1);
+        }
+
+        // Silence is measured from the echo, so the next keepalive fires one
+        // timeout after it and the counter keeps climbing.
+        assert!(matches!(
+            tick_idle(&mut state, echo, echo + secs(30), &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        assert_eq!(state.retry_count, 2);
+    }
+
+    /// Output stamped exactly at the end of the grace window counts as
+    /// recovery; output one millisecond earlier does not.
+    #[test]
+    fn idle_output_exactly_at_grace_edge_resets_counter() {
+        let mut state = idle_state(30, 3);
+        let t0 = Instant::now();
+        let injected = t0 + secs(30);
+        assert!(matches!(
+            tick_idle(&mut state, t0, injected, &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+
+        let edge = injected + secs(KEEPALIVE_GRACE_SECS);
+        let just_before = edge - Duration::from_millis(1);
+        assert!(matches!(
+            tick_idle(&mut state, just_before, edge, &mut None),
+            IdleTick::Ok
+        ));
+        assert_eq!(state.retry_count, 1);
+
+        assert!(matches!(
+            tick_idle(&mut state, edge, edge, &mut None),
+            IdleTick::Recovered
+        ));
+        assert_eq!(state.retry_count, 0);
+    }
+
+    /// Output stamped at the same instant as the injection is echo, not
+    /// recovery, even once wall-clock time is past the grace window.
+    #[test]
+    fn idle_output_at_injection_instant_is_not_recovery() {
+        let mut state = idle_state(30, 3);
+        let t0 = Instant::now();
+        let injected = t0 + secs(30);
+        assert!(matches!(
+            tick_idle(&mut state, t0, injected, &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+
+        for s in 0..30 {
+            assert!(
+                matches!(
+                    tick_idle(&mut state, injected, injected + secs(s), &mut None),
+                    IdleTick::Ok
+                ),
+                "output at the injection instant must not count as recovery at +{s}s"
+            );
+        }
+        assert_eq!(state.retry_count, 1);
+        assert!(matches!(
+            tick_idle(&mut state, injected, injected + secs(30), &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        assert_eq!(state.retry_count, 2);
+    }
+
+    /// With max_retries of 0 the first idle tick exhausts without injecting.
+    #[test]
+    fn idle_zero_max_retries_exhausts_without_injecting() {
+        let mut state = idle_state(30, 0);
+        let t0 = Instant::now();
+        assert!(matches!(
+            tick_idle(&mut state, t0, t0 + secs(29), &mut None),
+            IdleTick::Ok
+        ));
+        assert!(matches!(
+            tick_idle(&mut state, t0, t0 + secs(30), &mut None),
+            IdleTick::Exhausted
+        ));
+        assert_eq!(state.retry_count, 0);
+        assert!(state.last_keepalive.is_none());
+    }
+
+    /// With the idle timeout below the grace window, output that keeps silence
+    /// under the timeout is not credited until the grace window has passed,
+    /// and output that stops short of it leads to another injection.
+    #[test]
+    fn idle_timeout_below_grace_window() {
+        let t0 = Instant::now();
+
+        // Sustained output: credited at the first output past grace.
+        let mut state = idle_state(10, 3);
+        let injected = t0 + secs(10);
+        assert!(matches!(
+            tick_idle(&mut state, t0, injected, &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        for s in [5, 10, 15] {
+            let out = injected + secs(s);
+            assert!(matches!(
+                tick_idle(&mut state, out, out, &mut None),
+                IdleTick::Ok
+            ));
+        }
+        let out = injected + secs(KEEPALIVE_GRACE_SECS);
+        assert!(matches!(
+            tick_idle(&mut state, out, out, &mut None),
+            IdleTick::Recovered
+        ));
+
+        // One burst inside grace, then silence for a full timeout: the burst
+        // is not credited and the next keepalive fires.
+        let mut state = idle_state(10, 3);
+        assert!(matches!(
+            tick_idle(&mut state, t0, injected, &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        let burst = injected + secs(12);
+        assert!(matches!(
+            tick_idle(&mut state, burst, burst + secs(10), &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        assert_eq!(state.retry_count, 2);
     }
 }
