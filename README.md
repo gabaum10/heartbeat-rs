@@ -97,6 +97,7 @@ heartbeat-launch --timeout 0 -- claude "Read CLAUDE.md"
 |------|---------|-------------|
 | `--cwd <dir>` | `.` | Working directory for the child process. |
 | `--timeout <secs>` | `3600` | Seconds before the child is killed (SIGKILL). `0` means no timeout. |
+| `--version` | | Print the version and exit. Both binaries accept it; `heartbeat-launch` does not need a command for it. |
 
 Exit codes mirror the child process. Timeout exits with code `124` (same convention as `timeout(1)` on Linux).
 
@@ -114,6 +115,7 @@ Exit codes mirror the child process. Timeout exits with code `124` (same convent
 | `--inbox <path>` | required | Path to the JSONL inbox file. |
 | `--mode <mode>` | `drain` | Operating mode: `drain` or `persist`. |
 | `--idle-interval <seconds>` | `2` | Seconds to sleep between consecutive idle ticks in `persist` mode. Only applies when the inbox is empty. The first inbox check is always immediate; this delay governs the gap between idle ticks. Set higher (e.g. `300`) for consumers where the inbox is populated infrequently. |
+| `--version` | | Print the version and exit. |
 
 **Important:** `--idle-interval` causes the hook process to sleep inside the hook invocation. Ensure your `"timeout"` value in `.claude/settings.json` is greater than `--idle-interval`, or Claude Code will kill the hook before the sleep completes. For a 300-second interval, set `"timeout": 310` or higher. Messages arriving during the sleep wait until the next hook invocation.
 

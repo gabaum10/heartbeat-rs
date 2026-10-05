@@ -217,3 +217,17 @@ fn missing_inbox_flag_exits_nonzero() {
         "missing --inbox must exit non-zero"
     );
 }
+
+#[test]
+fn version_flag_prints_version_and_exits_zero() {
+    let out = Command::new(binary())
+        .arg("--version")
+        .output()
+        .expect("failed to run heartbeat-stop");
+
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("heartbeat-stop {}", env!("CARGO_PKG_VERSION"))
+    );
+}

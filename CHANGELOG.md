@@ -4,8 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `--version` on both `heartbeat-launch` and `heartbeat-stop`.
+
 ### Fixed
 
+- Idle keepalive in `heartbeat-launch` sends a single ESC, waits 1s, then the
+  prompt and CR. The previous back-to-back ESC ESC landed inside Claude Code's
+  800ms double-press window, opening the Rewind picker and losing the prompt;
+  the gap also stops the ESC merging with the prompt's first character into an
+  Alt-key chord.
 - Idle watchdog in `heartbeat-launch` (`src/pty.rs`) can exhaust again. A
   keepalive injection used to overwrite the reader's last-output timestamp, so
   once the grace window passed the retry counter reset with no real output and

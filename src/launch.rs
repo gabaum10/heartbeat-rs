@@ -17,6 +17,7 @@ use std::process;
 
 #[derive(Parser)]
 #[command(name = "heartbeat-launch")]
+#[command(version)]
 #[command(about = "Launch a command inside a PTY. Designed to give Claude Code interactive mode.")]
 #[command(
     long_about = "Allocates a PTY via portable-pty (Unix PTY + Windows ConPTY), spawns the \
@@ -50,16 +51,17 @@ struct Cli {
     /// Idle detection timeout in seconds (0 = disabled, default).
     ///
     /// If the PTY produces no output for this many seconds, a keepalive
-    /// sequence is injected: ESC (to cancel any stalled generation) followed
-    /// by --idle-prompt and a newline. This unsticks sessions where the
-    /// Anthropic API stream has hung mid-generation.
+    /// sequence is injected: ESC (to cancel any stalled generation), a 1s
+    /// pause, then --idle-prompt and a carriage return. This unsticks
+    /// sessions where the Anthropic API stream has hung mid-generation.
     #[arg(long, default_value = "0")]
     idle_timeout: u64,
 
     /// Text to inject after ESC when idle is detected.
     ///
     /// Only used when --idle-timeout > 0. Sent as plain text followed by a
-    /// newline to the PTY master after the ESC cancel byte.
+    /// carriage return to the PTY master, after the ESC cancel byte and a 1s
+    /// pause.
     #[arg(long, default_value = "Continue")]
     idle_prompt: String,
 
