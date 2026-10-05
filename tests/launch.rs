@@ -380,7 +380,8 @@ fn version_flag_after_separator_reaches_child() {
         .arg("--timeout")
         .arg("10")
         .arg("--")
-        .arg("echo")
+        .arg("printf")
+        .arg("%s\n")
         .arg("--version")
         .output()
         .expect("failed to run heartbeat-launch");
@@ -389,6 +390,10 @@ fn version_flag_after_separator_reaches_child() {
     assert!(
         stdout.contains("--version"),
         "child should receive --version, got: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("heartbeat-launch"),
+        "launcher must not consume --version after `--`, got: {stdout:?}"
     );
     assert_eq!(out.status.code(), Some(0));
 }

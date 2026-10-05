@@ -24,8 +24,8 @@ use libc;
 /// When the PTY produces no output for `timeout_secs` seconds, a keepalive
 /// sequence is injected: a single ESC (to cancel any stalled generation), a
 /// 1s pause (`KEEPALIVE_ESC_GAP`), then the `prompt` text and a carriage
-/// return. Retried up to `max_retries` times before
-/// giving up and killing the child.
+/// return. Retried up to `max_retries` times before giving up and killing the
+/// child.
 ///
 /// `timeout_secs == 0` disables idle detection entirely.
 #[derive(Debug, Clone)]
@@ -442,7 +442,8 @@ fn tick_idle(
 /// `idle` — optional idle detection config. When `idle.timeout_secs > 0` and
 /// the PTY produces no output for that many seconds, a single ESC, a 1s pause
 /// (`KEEPALIVE_ESC_GAP`), then the `idle` keepalive text and a carriage return
-/// are sent to unstick a stalled session. After `idle.max_retries` injections without recovery, the child is killed.
+/// are sent to unstick a stalled session. After `idle.max_retries` injections
+/// without recovery, the child is killed.
 pub fn run(
     argv: &[String],
     cwd: &Path,
@@ -1030,12 +1031,17 @@ mod tests {
             Some(Box::new(RecordingWriter(log.clone())));
         let mut state = idle_state(10, 3);
         let t0 = Instant::now();
+        let idle_now = t0 + secs(10);
         assert!(matches!(
-            tick_idle(&mut state, t0, t0 + secs(10), &mut writer),
+            tick_idle(&mut state, t0, idle_now, &mut writer),
             IdleTick::KeepaliveInjected
         ));
         let log = log.lock().unwrap();
-        let bytes: Vec<&[u8]> = log.iter().map(|(_, b)| b.as_slice()).collect();
-        assert_eq!(bytes, vec![&b"\x1b"[..], b"Continue", b"\r"]);
+        let bytes: Vec<u8> = log.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(bytes, b"\x1bContinue\r");
+        assert!(
+            state.last_keepalive.unwrap() >= idle_now + KEEPALIVE_ESC_GAP,
+            "keepalive stamp must be taken after the blocking send, not at tick start"
+        );
     }
 }
