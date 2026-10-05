@@ -17,6 +17,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "heartbeat-stop",
+    version,
     about = "Claude Code stop hook for autonomous agent loops",
     long_about = "Reads from a JSONL inbox at a byte offset and outputs a block/approve \
                   decision. Used as a Stop hook in .claude/settings.json to keep a \

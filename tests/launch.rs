@@ -350,3 +350,21 @@ fn tty_is_allocated() {
         "expected stdout to be exactly 'tty' (child should see a TTY), got: {stdout:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --version works without the required command
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_flag_prints_version_and_exits_zero() {
+    let out = Command::new(binary())
+        .arg("--version")
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("heartbeat-launch {}", env!("CARGO_PKG_VERSION"))
+    );
+}

@@ -17,6 +17,7 @@ use std::process;
 
 #[derive(Parser)]
 #[command(name = "heartbeat-launch")]
+#[command(version)]
 #[command(about = "Launch a command inside a PTY. Designed to give Claude Code interactive mode.")]
 #[command(
     long_about = "Allocates a PTY via portable-pty (Unix PTY + Windows ConPTY), spawns the \

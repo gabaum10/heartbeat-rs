@@ -97,6 +97,7 @@ heartbeat-launch --timeout 0 -- claude "Read CLAUDE.md"
 |------|---------|-------------|
 | `--cwd <dir>` | `.` | Working directory for the child process. |
 | `--timeout <secs>` | `3600` | Seconds before the child is killed (SIGKILL). `0` means no timeout. |
+| `--version` | | Print the version and exit. Both binaries accept it; `heartbeat-launch` does not need a command for it. |
 
 Exit codes mirror the child process. Timeout exits with code `124` (same convention as `timeout(1)` on Linux).
 
