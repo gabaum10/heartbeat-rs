@@ -22,8 +22,9 @@ use libc;
 /// Configuration for idle detection and keepalive injection.
 ///
 /// When the PTY produces no output for `timeout_secs` seconds, a keepalive
-/// sequence is injected: ESC (to cancel any stalled generation) followed by
-/// the `prompt` text and a newline. Retried up to `max_retries` times before
+/// sequence is injected: a single ESC (to cancel any stalled generation), a
+/// 1s pause (`KEEPALIVE_ESC_GAP`), then the `prompt` text and a carriage
+/// return. Retried up to `max_retries` times before
 /// giving up and killing the child.
 ///
 /// `timeout_secs == 0` disables idle detection entirely.
@@ -383,8 +384,13 @@ fn tick_idle(
             state.max_retries,
         );
 
+        // The send blocks for KEEPALIVE_ESC_GAP; stamp the injection with the
+        // time it finished, so the idle timer restarts from the real end of it.
+        let mut stamp = now;
         if let Some(ref mut w) = pty_writer {
+            let started = Instant::now();
             send_keepalive(w, &state.prompt, KEEPALIVE_ESC_GAP);
+            stamp = now + started.elapsed();
         }
 
         // Record when we injected. This restarts the idle timer (silence is
@@ -392,7 +398,7 @@ fn tick_idle(
         // the reader's output timestamp: overwriting that made the injection
         // itself look like resumed output, so the retry counter reset on
         // every cycle and never reached exhaustion.
-        state.last_keepalive = Some(now);
+        state.last_keepalive = Some(stamp);
 
         IdleTick::KeepaliveInjected
     } else if state.retry_count > 0 {
@@ -434,9 +440,9 @@ fn tick_idle(
 /// SIGTERM first, then SIGKILL after a short grace period if it has not exited.
 ///
 /// `idle` — optional idle detection config. When `idle.timeout_secs > 0` and
-/// the PTY produces no output for that many seconds, ESC-ESC followed by
-/// the `idle` keepalive text and a carriage return is sent to unstick a stalled session. After
-/// `idle.max_retries` injections without recovery, the child is killed.
+/// the PTY produces no output for that many seconds, a single ESC, a 1s pause
+/// (`KEEPALIVE_ESC_GAP`), then the `idle` keepalive text and a carriage return
+/// are sent to unstick a stalled session. After `idle.max_retries` injections without recovery, the child is killed.
 pub fn run(
     argv: &[String],
     cwd: &Path,
@@ -1008,9 +1014,28 @@ mod tests {
             vec![&b"\x1b"[..], b"Continue with the PR review.", b"\r"]
         );
         assert!(
-            log[1].0.duration_since(log[0].0) >= Duration::from_millis(800),
-            "gap between ESC and prompt must exceed the 800ms double-press window"
+            log[1].0.duration_since(log[0].0) >= KEEPALIVE_ESC_GAP,
+            "measured gap between ESC and prompt must be at least KEEPALIVE_ESC_GAP"
         );
-        assert!(KEEPALIVE_ESC_GAP > Duration::from_millis(800));
+        assert!(
+            KEEPALIVE_ESC_GAP > Duration::from_millis(800),
+            "KEEPALIVE_ESC_GAP must exceed Claude's 800ms double-press window"
+        );
+    }
+
+    #[test]
+    fn tick_idle_writes_esc_prompt_cr_once() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut writer: Option<Box<dyn Write + Send>> =
+            Some(Box::new(RecordingWriter(log.clone())));
+        let mut state = idle_state(10, 3);
+        let t0 = Instant::now();
+        assert!(matches!(
+            tick_idle(&mut state, t0, t0 + secs(10), &mut writer),
+            IdleTick::KeepaliveInjected
+        ));
+        let log = log.lock().unwrap();
+        let bytes: Vec<&[u8]> = log.iter().map(|(_, b)| b.as_slice()).collect();
+        assert_eq!(bytes, vec![&b"\x1b"[..], b"Continue", b"\r"]);
     }
 }

@@ -368,3 +368,27 @@ fn version_flag_prints_version_and_exits_zero() {
         format!("heartbeat-launch {}", env!("CARGO_PKG_VERSION"))
     );
 }
+
+// ---------------------------------------------------------------------------
+// `--version` after `--` belongs to the child; clap must not consume it
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn version_flag_after_separator_reaches_child() {
+    let out = Command::new(binary())
+        .arg("--timeout")
+        .arg("10")
+        .arg("--")
+        .arg("echo")
+        .arg("--version")
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--version"),
+        "child should receive --version, got: {stdout:?}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
