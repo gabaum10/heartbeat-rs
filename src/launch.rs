@@ -33,9 +33,7 @@ const EXIT_UNRECOVERED_KEEPALIVE: i32 = 122;
                   exited 0 after an idle keepalive was injected and it never produced \
                   genuine output afterwards -- a 0 that cannot be trusted), 124 (timeout), \
                   125 (idle timeout exhausted, child killed), 1 (internal heartbeat-launch \
-                  error), and 0 whenever --exit-signal fired, however the child died. The \
-                  stderr line `heartbeat-launch: child exited with code N` marks a plain \
-                  forward; any other heartbeat-launch: line marks an exception.\n\n\
+                  error), and 0 whenever --exit-signal fired, however the child died.\n\n\
                   Everything after `--` is the command and its arguments. The consumer \
                   is responsible for inbox setup, settings.json, and stop hook wiring."
 )]

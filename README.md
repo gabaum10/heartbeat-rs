@@ -99,7 +99,7 @@ heartbeat-launch --timeout 0 -- claude "Read CLAUDE.md"
 | `--timeout <secs>` | `3600` | Seconds before the child is killed (SIGKILL). `0` means no timeout. |
 | `--version` | | Print the version and exit. Both binaries accept it; `heartbeat-launch` does not need a command for it. |
 
-Exit codes mirror the child process, with these exceptions: `122` (the child exited `0` after an idle keepalive was injected and never produced genuine output afterwards, so the `0` is not trusted; a non-zero child code in that case is forwarded unchanged), `124` (timeout, same convention as `timeout(1)` on Linux), `125` (idle timeout exhausted, child killed), `1` on an internal `heartbeat-launch` error, and `0` whenever `--exit-signal` fired, however the child died. The stderr line `heartbeat-launch: child exited with code N` marks a plain forward; any other `heartbeat-launch:` line marks one of the exceptions. Runs that never hit an idle keepalive, including everything at the default `--idle-timeout 0`, are unaffected.
+Exit codes mirror the child process, with these exceptions: `122` (the child exited `0` after an idle keepalive was injected and never produced genuine output afterwards, so the `0` is not trusted; a non-zero child code in that case is forwarded unchanged), `124` (timeout, same convention as `timeout(1)` on Linux), `125` (idle timeout exhausted, child killed), `1` on an internal `heartbeat-launch` error, and `0` whenever `--exit-signal` fired, however the child died. Runs that never hit an idle keepalive, including everything at the default `--idle-timeout 0`, are unaffected.
 
 ## Modes
 
