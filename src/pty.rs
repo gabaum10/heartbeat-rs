@@ -40,9 +40,27 @@ pub struct IdleConfig {
 
 /// Result of a PTY session.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct RunResult {
     /// Exit code from the child process.
     pub exit_code: u32,
+
+    /// True when at least one idle keepalive was injected and the session never
+    /// genuinely recovered from it before the child exited.
+    ///
+    /// "Recovered" is the same criterion the idle watchdog uses: real PTY output
+    /// at or after the last keepalive plus `KEEPALIVE_GRACE_SECS`. Output inside
+    /// that window is the PTY echoing the injected bytes and does not count. It
+    /// is judged at exit time, against the reader's final output timestamp, so
+    /// output drained after the child exits still counts (within `join_reader`'s
+    /// 2s drain window).
+    ///
+    /// Always false on the `exit_signal` path: heartbeat-stop approving means a
+    /// turn completed, so the synthesized exit code 0 is legitimate there.
+    ///
+    /// Known limit: a child that genuinely recovers and then exits inside the
+    /// grace window (a short-lived non-Claude child, say) reads as unrecovered.
+    pub unrecovered_keepalive: bool,
 }
 
 /// Errors from PTY operations.
@@ -293,6 +311,34 @@ struct IdleState {
 
 const KEEPALIVE_GRACE_SECS: u64 = 20;
 
+/// True when `last_output` is genuine output after the keepalive stamped at
+/// `keepalive`: at or past the end of the grace window. Output inside the
+/// window is the PTY echoing the injected bytes. The single recovery criterion,
+/// shared by the poll-loop reset and the exit-time check.
+fn output_past_grace(keepalive: Instant, last_output: Instant) -> bool {
+    last_output >= keepalive + Duration::from_secs(KEEPALIVE_GRACE_SECS)
+}
+
+/// Exit-time decision: did the child exit with an idle keepalive outstanding
+/// that the session never recovered from?
+///
+/// `last_keepalive` is `IdleState::last_keepalive` (`None` when no keepalive
+/// was injected, or the poll loop already credited recovery and cleared it).
+/// Judged here against the final `last_output` rather than `retry_count`,
+/// because the poll loop's reset may not have run if the child exited between
+/// ticks. `exit_sent` suppresses the flag: the exit-signal path means a turn
+/// completed.
+fn is_unrecovered_keepalive(
+    last_keepalive: Option<Instant>,
+    last_output: Instant,
+    exit_sent: bool,
+) -> bool {
+    if exit_sent {
+        return false;
+    }
+    last_keepalive.is_some_and(|k| !output_past_grace(k, last_output))
+}
+
 /// Pause between the keepalive's ESC and the prompt text.
 ///
 /// Must exceed Claude Code's 800ms double-press window: a second ESC (or any
@@ -408,7 +454,7 @@ fn tick_idle(
         // mere passage of time without output is not recovery at all.
         let past_grace = state
             .last_keepalive
-            .is_none_or(|k| last_output >= k + Duration::from_secs(KEEPALIVE_GRACE_SECS));
+            .is_none_or(|k| output_past_grace(k, last_output));
         if past_grace {
             eprintln!(
                 "heartbeat-launch: output resumed — resetting idle retry counter (was {})",
@@ -443,7 +489,9 @@ fn tick_idle(
 /// the PTY produces no output for that many seconds, a single ESC, a 1s pause
 /// (`KEEPALIVE_ESC_GAP`), then the `idle` keepalive text and a carriage return
 /// are sent to unstick a stalled session. After `idle.max_retries` injections
-/// without recovery, the child is killed.
+/// without recovery, the child is killed. If the child instead exits on its own
+/// after a keepalive without genuine output following it, the result carries
+/// `unrecovered_keepalive: true` so the caller does not treat the exit as success.
 pub fn run(
     argv: &[String],
     cwd: &Path,
@@ -625,8 +673,19 @@ pub fn run(
     // Normal exit: shut down reader thread.
     join_reader(reader_thread, &stop, master);
 
+    // The reader is joined, so trailing output is already stamped.
+    let final_output_at = last_output
+        .lock()
+        .map(|ts| *ts)
+        .unwrap_or_else(|e| *e.into_inner());
+    let unrecovered_keepalive =
+        is_unrecovered_keepalive(idle_state.last_keepalive, final_output_at, exit_sent);
+
     let exit_code = if exit_sent { 0 } else { exit_code };
-    Ok(RunResult { exit_code })
+    Ok(RunResult {
+        exit_code,
+        unrecovered_keepalive,
+    })
 }
 
 #[cfg(test)]
@@ -1043,5 +1102,85 @@ mod tests {
             state.last_keepalive.unwrap() >= idle_now + KEEPALIVE_ESC_GAP,
             "keepalive stamp must be taken after the blocking send, not at tick start"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Exit-time unrecovered-keepalive decision (pure, no PTY).
+    // -----------------------------------------------------------------------
+
+    /// Keepalive outstanding and the only output is at-or-before the injection
+    /// (echo): unrecovered.
+    #[test]
+    fn unrecovered_when_keepalive_outstanding_and_no_later_output() {
+        let t0 = Instant::now();
+        let injected = t0 + secs(30);
+        // Last output predates the injection entirely.
+        assert!(is_unrecovered_keepalive(Some(injected), t0, false));
+        // Echo inside the grace window, including one millisecond short of it.
+        assert!(is_unrecovered_keepalive(
+            Some(injected),
+            injected + secs(1),
+            false
+        ));
+        assert!(is_unrecovered_keepalive(
+            Some(injected),
+            injected + secs(KEEPALIVE_GRACE_SECS) - Duration::from_millis(1),
+            false
+        ));
+    }
+
+    /// Output at or past the end of the grace window is genuine recovery, the
+    /// same edge `tick_idle` uses.
+    #[test]
+    fn recovered_when_output_past_grace() {
+        let t0 = Instant::now();
+        let injected = t0 + secs(30);
+        assert!(!is_unrecovered_keepalive(
+            Some(injected),
+            injected + secs(KEEPALIVE_GRACE_SECS),
+            false
+        ));
+        assert!(!is_unrecovered_keepalive(
+            Some(injected),
+            injected + secs(KEEPALIVE_GRACE_SECS + 5),
+            false
+        ));
+    }
+
+    /// No keepalive ever injected (or recovery already credited and cleared):
+    /// never flagged, whatever the output timestamp.
+    #[test]
+    fn never_flagged_without_a_keepalive() {
+        assert!(!is_unrecovered_keepalive(None, Instant::now(), false));
+    }
+
+    /// The exit-signal path suppresses the flag even with a keepalive that
+    /// never recovered.
+    #[test]
+    fn exit_sent_suppresses_flag() {
+        let t0 = Instant::now();
+        assert!(!is_unrecovered_keepalive(Some(t0 + secs(30)), t0, true));
+    }
+
+    /// Exit-time evaluation agrees with the tick's own criterion for the case
+    /// where the poll loop never got to run its reset: after a real tick
+    /// injected a keepalive, output past grace reads as recovered at exit even
+    /// though `retry_count` was never reset.
+    #[test]
+    fn exit_check_covers_exit_between_ticks() {
+        let mut state = idle_state(30, 3);
+        let t0 = Instant::now();
+        assert!(matches!(
+            tick_idle(&mut state, t0, t0 + secs(30), &mut None),
+            IdleTick::KeepaliveInjected
+        ));
+        assert_eq!(state.retry_count, 1);
+        let late = state.last_keepalive.unwrap() + secs(KEEPALIVE_GRACE_SECS + 1);
+        assert!(!is_unrecovered_keepalive(state.last_keepalive, late, false));
+        assert!(is_unrecovered_keepalive(
+            state.last_keepalive,
+            state.last_keepalive.unwrap(),
+            false
+        ));
     }
 }

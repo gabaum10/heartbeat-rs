@@ -2,7 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.0] - 2026-11-05
+
+### Changed
+
+- `heartbeat-launch` no longer reports success when the child exits 0 after an
+  idle keepalive it never recovered from. If at least one keepalive was
+  injected and the session produced no genuine output after it (output at or
+  after the keepalive plus the 20s grace window; earlier output is the PTY
+  echoing the injected bytes), a child exit of 0 now exits **122** with a
+  `heartbeat-launch:` stderr line. Claude Code's bypass-mode startup disclaimer
+  reads the keepalive's ESC as "exit" and exits 0, which previously looked like
+  a completed pass. A non-zero child code is still forwarded unchanged, with a
+  stderr note. Runs that never inject a keepalive (including the default
+  `--idle-timeout 0`) are unchanged. The `--exit-signal` path is unchanged.
+  Known limit: a child that genuinely recovers and then exits 0 on its own
+  within 20s of the keepalive reads as unrecovered (122).
+- `pty::RunResult` gains the public field `unrecovered_keepalive: bool` and is
+  now `#[non_exhaustive]`, so later fields won't be a breaking change.
+
+## [0.5.6] - 2026-10-05
+
+Also covers 0.5.5.
 
 ### Added
 

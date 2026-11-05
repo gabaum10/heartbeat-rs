@@ -15,6 +15,11 @@ use heartbeat_rs::pty::{self, IdleConfig};
 use std::path::PathBuf;
 use std::process;
 
+/// Exit code when the child exited 0 after an idle keepalive it never
+/// recovered from. 122 stays clear of 123 (the retired clamp value), 124
+/// (timeout) and 125 (idle exhausted), and of 126/127 (shell-reserved).
+const EXIT_UNRECOVERED_KEEPALIVE: i32 = 122;
+
 #[derive(Parser)]
 #[command(name = "heartbeat-launch")]
 #[command(version)]
@@ -24,6 +29,11 @@ use std::process;
                   given command inside it, and forwards stdout to the current process. \
                   Polls for child exit with a configurable timeout and exits with the \
                   child's exit code.\n\n\
+                  Exit codes: the child's own code is forwarded, except 122 (the child \
+                  exited 0 after an idle keepalive was injected and it never produced \
+                  genuine output afterwards -- a 0 that cannot be trusted), 124 (timeout), \
+                  125 (idle timeout exhausted, child killed), 1 (internal heartbeat-launch \
+                  error), and 0 whenever --exit-signal fired, however the child died.\n\n\
                   Everything after `--` is the command and its arguments. The consumer \
                   is responsible for inbox setup, settings.json, and stop hook wiring."
 )]
@@ -54,6 +64,13 @@ struct Cli {
     /// sequence is injected: ESC (to cancel any stalled generation), a 1s
     /// pause, then --idle-prompt and a carriage return. This unsticks
     /// sessions where the Anthropic API stream has hung mid-generation.
+    ///
+    /// If the child then exits without genuine output after the keepalive
+    /// (output at least 20s after it; earlier output is the PTY echoing the
+    /// injected bytes), a child exit of 0 is reported as 122 instead of
+    /// success, and a non-zero code is forwarded with a stderr note. Known
+    /// limit: a child that genuinely recovers and then exits 0 on its own
+    /// within 20s of the keepalive reads as unrecovered (122).
     #[arg(long, default_value = "0")]
     idle_timeout: u64,
 
@@ -69,6 +86,8 @@ struct Cli {
     ///
     /// If the session remains idle after this many injections, the child is
     /// killed and heartbeat-launch exits 125 (distinct from --timeout's 124).
+    /// A child that exits on its own after an unrecovered keepalive is handled
+    /// separately: exit 0 becomes 122 (see --idle-timeout).
     /// Only used when --idle-timeout > 0.
     #[arg(long, default_value = "3")]
     max_idle_retries: u32,
@@ -159,6 +178,18 @@ fn main() {
             // the exit signal has been sent, regardless of how the child
             // actually died.
             //
+            // One more heartbeat-decided outcome rides on the same
+            // convention: when pty.rs reports `unrecovered_keepalive` (an
+            // idle keepalive was injected and the child exited with no
+            // genuine output after it), a child exit of 0 is NOT forwarded.
+            // It becomes EXIT_UNRECOVERED_KEEPALIVE (122) with a
+            // heartbeat-authored stderr line, because that 0 is the child
+            // reading the keepalive as "exit" (Claude Code's bypass-mode
+            // disclaimer does this), not a completed session. A non-zero
+            // child code is still forwarded as-is; only a stderr note is
+            // added. With the flag false (every run at the default
+            // --idle-timeout 0) nothing here changes.
+            //
             // u32 -> i32: exit_code is portable-pty's u32. On Unix, a
             // child that exits normally has already been through the
             // kernel's own truncation to 0..=255 before we ever see it
@@ -183,6 +214,20 @@ fn main() {
                     i32::MAX
                 }
             };
+            if result.unrecovered_keepalive {
+                if code == 0 {
+                    eprintln!(
+                        "heartbeat-launch: child exited 0 after an unrecovered idle keepalive \
+                         (no genuine output after it) — exiting {EXIT_UNRECOVERED_KEEPALIVE}, not success"
+                    );
+                    process::exit(EXIT_UNRECOVERED_KEEPALIVE);
+                }
+                eprintln!(
+                    "heartbeat-launch: child exited {code} after an unrecovered idle keepalive \
+                     (no genuine output after it) — forwarding {code}"
+                );
+                process::exit(code);
+            }
             eprintln!("heartbeat-launch: child exited with code {code}");
             process::exit(code);
         }
