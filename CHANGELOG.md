@@ -16,9 +16,10 @@ All notable changes to this project will be documented in this file.
   a completed pass. A non-zero child code is still forwarded unchanged, with a
   stderr note. Runs that never inject a keepalive (including the default
   `--idle-timeout 0`) are unchanged. The `--exit-signal` path is unchanged.
-  Known limit: a non-Claude child that genuinely recovers and then exits 0
-  inside the grace window reads as unrecovered.
-- `pty::RunResult` gains the public field `unrecovered_keepalive: bool`.
+  Known limit: a child that genuinely recovers and then exits 0 on its own
+  within 20s of the keepalive reads as unrecovered (122).
+- `pty::RunResult` gains the public field `unrecovered_keepalive: bool` and is
+  now `#[non_exhaustive]`, so later fields won't be a breaking change.
 
 ## [0.5.6] - 2026-10-05
 

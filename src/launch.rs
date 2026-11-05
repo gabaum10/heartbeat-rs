@@ -29,11 +29,13 @@ const EXIT_UNRECOVERED_KEEPALIVE: i32 = 122;
                   given command inside it, and forwards stdout to the current process. \
                   Polls for child exit with a configurable timeout and exits with the \
                   child's exit code.\n\n\
-                  Exit codes: the child's own code is forwarded, except 124 (timeout), \
-                  125 (idle timeout exhausted, child killed) and 122 (the child exited 0 \
-                  after an idle keepalive was injected and it never produced genuine \
-                  output afterwards -- a 0 that cannot be trusted). A heartbeat-launch: \
-                  line on stderr marks each of these.\n\n\
+                  Exit codes: the child's own code is forwarded, except 122 (the child \
+                  exited 0 after an idle keepalive was injected and it never produced \
+                  genuine output afterwards -- a 0 that cannot be trusted), 124 (timeout), \
+                  125 (idle timeout exhausted, child killed), 1 (internal heartbeat-launch \
+                  error), and 0 whenever --exit-signal fired, however the child died. The \
+                  stderr line `heartbeat-launch: child exited with code N` marks a plain \
+                  forward; any other heartbeat-launch: line marks an exception.\n\n\
                   Everything after `--` is the command and its arguments. The consumer \
                   is responsible for inbox setup, settings.json, and stop hook wiring."
 )]
@@ -69,8 +71,8 @@ struct Cli {
     /// (output at least 20s after it; earlier output is the PTY echoing the
     /// injected bytes), a child exit of 0 is reported as 122 instead of
     /// success, and a non-zero code is forwarded with a stderr note. Known
-    /// limit: a non-Claude child that genuinely recovers and then exits 0
-    /// inside that 20s window reads as unrecovered.
+    /// limit: a child that genuinely recovers and then exits 0 on its own
+    /// within 20s of the keepalive reads as unrecovered (122).
     #[arg(long, default_value = "0")]
     idle_timeout: u64,
 

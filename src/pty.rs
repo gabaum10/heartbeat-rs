@@ -40,6 +40,7 @@ pub struct IdleConfig {
 
 /// Result of a PTY session.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct RunResult {
     /// Exit code from the child process.
     pub exit_code: u32,
@@ -51,7 +52,8 @@ pub struct RunResult {
     /// at or after the last keepalive plus `KEEPALIVE_GRACE_SECS`. Output inside
     /// that window is the PTY echoing the injected bytes and does not count. It
     /// is judged at exit time, against the reader's final output timestamp, so
-    /// output drained after the child exits still counts.
+    /// output drained after the child exits still counts (within `join_reader`'s
+    /// 2s drain window).
     ///
     /// Always false on the `exit_signal` path: heartbeat-stop approving means a
     /// turn completed, so the synthesized exit code 0 is legitimate there.

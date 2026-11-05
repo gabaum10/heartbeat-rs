@@ -459,7 +459,7 @@ fn nonzero_exit_after_unrecovered_keepalive_is_forwarded() {
 #[test]
 fn prompt_exit_zero_with_idle_timeout_still_exits_zero() {
     let out = Command::new(binary())
-        .args(["--idle-timeout", "1", "--timeout", "30", "--"])
+        .args(["--idle-timeout", "5", "--timeout", "30", "--"])
         .args(["sh", "-c", "exit 0"])
         .output()
         .expect("failed to run heartbeat-launch");
