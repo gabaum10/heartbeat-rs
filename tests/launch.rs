@@ -380,8 +380,14 @@ fn version_flag_after_separator_reaches_child() {
         .arg("--timeout")
         .arg("10")
         .arg("--")
-        .arg("printf")
-        .arg("%s\n")
+        // The flag reaches the child as a positional arg and is echoed by the
+        // shell's builtin printf. A bare coreutils `printf %s\n --version`
+        // is not portable: uutils printf (now on GitHub's ubuntu runners)
+        // answers `--version` itself instead of echoing it.
+        .arg("sh")
+        .arg("-c")
+        .arg("printf '%s\\n' \"$1\"")
+        .arg("_")
         .arg("--version")
         .output()
         .expect("failed to run heartbeat-launch");
