@@ -397,3 +397,71 @@ fn version_flag_after_separator_reaches_child() {
     );
     assert_eq!(out.status.code(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// Unrecovered idle keepalive (soren#509): a child that exits 0 after an idle
+// keepalive was injected, without ever producing real output afterwards, must
+// not read as success. `read x` blocks until the keepalive's CR terminates the
+// line, then the shell exits 0 -- the same shape as Claude Code's bypass-mode
+// disclaimer treating the keepalive's ESC as "exit".
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn exit_zero_after_unrecovered_keepalive_exits_122() {
+    let out = Command::new(binary())
+        .args(["--idle-timeout", "1", "--timeout", "30", "--"])
+        .args(["sh", "-c", "read x; exit 0"])
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(122),
+        "exit 0 after an unrecovered keepalive must exit 122; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("heartbeat-launch: child exited 0 after an unrecovered idle keepalive"),
+        "expected the heartbeat-launch 122 diagnostic; stderr: {stderr:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn nonzero_exit_after_unrecovered_keepalive_is_forwarded() {
+    let out = Command::new(binary())
+        .args(["--idle-timeout", "1", "--timeout", "30", "--"])
+        .args(["sh", "-c", "read x; exit 3"])
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "child's non-zero code must be forwarded unchanged; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("heartbeat-launch: child exited 3 after an unrecovered idle keepalive"),
+        "expected the unrecovered-keepalive note; stderr: {stderr:?}"
+    );
+}
+
+/// Backward-compat control: no keepalive ever injected, so exit 0 is exit 0.
+#[cfg(unix)]
+#[test]
+fn prompt_exit_zero_with_idle_timeout_still_exits_zero() {
+    let out = Command::new(binary())
+        .args(["--idle-timeout", "1", "--timeout", "30", "--"])
+        .args(["sh", "-c", "exit 0"])
+        .output()
+        .expect("failed to run heartbeat-launch");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr:?}");
+    assert!(
+        !stderr.contains("unrecovered"),
+        "no keepalive was sent, so no unrecovered note; stderr: {stderr:?}"
+    );
+}
