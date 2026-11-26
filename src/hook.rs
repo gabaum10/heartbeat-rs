@@ -40,6 +40,13 @@ use crate::error::{HeartbeatError, Result};
 use crate::in_flight::{self, InFlightEntry};
 use crate::inbox;
 
+/// Environment variable `heartbeat-launch` sets to `1` in the child's
+/// environment when idle keepalive is enabled (`--idle-timeout > 0`), and
+/// removes otherwise. `heartbeat-stop` reads it (the hook inherits the
+/// session's environment) to know that a new turn will follow an unsignalled
+/// Approve.
+pub const IDLE_KEEPALIVE_ENV: &str = "HEARTBEAT_IDLE_KEEPALIVE";
+
 /// Operating mode for the stop hook.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {

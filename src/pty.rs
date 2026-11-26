@@ -167,7 +167,11 @@ struct PtySpawn {
 /// The reader is a clone of the master's read handle; it does NOT consume the
 /// master — the caller still holds `master` for `take_writer()` and
 /// `process_group_leader()`.
-fn spawn_pty_child(argv: &[String], cwd: &Path) -> Result<PtySpawn, PtyError> {
+fn spawn_pty_child(
+    argv: &[String],
+    cwd: &Path,
+    idle_keepalive: bool,
+) -> Result<PtySpawn, PtyError> {
     let pty_system = native_pty_system();
 
     let pair = pty_system
@@ -232,6 +236,15 @@ fn spawn_pty_child(argv: &[String], cwd: &Path) -> Result<PtySpawn, PtyError> {
         "AI_AGENT",
     ] {
         cmd.env_remove(key);
+    }
+
+    // Tell heartbeat-stop (a descendant of the child) whether a keepalive will
+    // follow an unsignalled Approve. Always set or removed, never inherited,
+    // so a stale value from an outer launcher cannot leak in.
+    if idle_keepalive {
+        cmd.env(crate::hook::IDLE_KEEPALIVE_ENV, "1");
+    } else {
+        cmd.env_remove(crate::hook::IDLE_KEEPALIVE_ENV);
     }
 
     let child = pair.slave.spawn_command(cmd).map_err(PtyError::Spawn)?;
@@ -504,7 +517,7 @@ pub fn run(
         mut child,
         mut killer,
         reader,
-    } = spawn_pty_child(argv, cwd)?;
+    } = spawn_pty_child(argv, cwd, idle.is_some_and(|c| c.timeout_secs > 0))?;
 
     // Shared flag: main thread signals reader thread to stop on timeout.
     let stop = Arc::new(Mutex::new(false));
@@ -714,6 +727,57 @@ mod tests {
         )
         .expect("run should succeed");
         assert_eq!(result.exit_code, 0, "echo should exit 0");
+    }
+
+    /// Run `sh -c 'printf %s "${VAR-unset}" > file'` through `run` and return
+    /// what the child saw for the keepalive env var.
+    #[cfg(unix)]
+    fn keepalive_env_seen_by_child(tag: &str, idle: Option<&IdleConfig>) -> String {
+        let out = tmp().join(format!("hb-keepalive-env-{}-{tag}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let script = format!(
+            "printf %s \"${{{}-unset}}\" > {}",
+            crate::hook::IDLE_KEEPALIVE_ENV,
+            out.display()
+        );
+        let result = run(
+            &["sh".to_string(), "-c".to_string(), script],
+            &tmp(),
+            10,
+            None,
+            idle,
+        )
+        .expect("run should succeed");
+        assert_eq!(result.exit_code, 0);
+        let seen = std::fs::read_to_string(&out).expect("child wrote the env value");
+        let _ = std::fs::remove_file(&out);
+        seen
+    }
+
+    /// The child sees IDLE_KEEPALIVE_ENV=1 exactly when idle keepalive is on.
+    /// (Env is process-global; this test is the only one touching the var.)
+    #[cfg(unix)]
+    #[test]
+    fn keepalive_env_set_only_when_idle_enabled() {
+        let on = IdleConfig {
+            timeout_secs: 120,
+            prompt: "Continue".to_string(),
+            max_retries: 3,
+        };
+        assert_eq!(keepalive_env_seen_by_child("on", Some(&on)), "1");
+
+        let zero = IdleConfig {
+            timeout_secs: 0,
+            ..on.clone()
+        };
+        assert_eq!(keepalive_env_seen_by_child("zero", Some(&zero)), "unset");
+        assert_eq!(keepalive_env_seen_by_child("none", None), "unset");
+
+        // A stale value inherited from an outer launcher must not leak through.
+        std::env::set_var(crate::hook::IDLE_KEEPALIVE_ENV, "1");
+        let seen = keepalive_env_seen_by_child("stale", None);
+        std::env::remove_var(crate::hook::IDLE_KEEPALIVE_ENV);
+        assert_eq!(seen, "unset");
     }
 
     /// A command that exits non-zero propagates the exit code.

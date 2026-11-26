@@ -124,6 +124,51 @@ impl From<CliOrphanPolicy> for OrphanPolicy {
     }
 }
 
+/// Consecutive fail-open passes (under idle keepalive) allowed to leave the
+/// signal file untouched before the next one touches it and ends the run. Each
+/// skipped pass costs one keepalive interval, so this caps a persistent error
+/// at that many extra keepalive cycles. Matches heartbeat-launch's default
+/// `--max-idle-retries`.
+const MAX_SKIPPED_SIGNAL_TOUCHES: u32 = 3;
+
+/// Counter file for consecutive skipped touches, next to the inbox.
+const SKIP_COUNT_FILE: &str = ".fail-open-skips";
+
+/// True when this fail-open pass may skip the signal touch: fewer than
+/// `MAX_SKIPPED_SIGNAL_TOUCHES` consecutive skips are recorded, and recording
+/// this one succeeded. Any doubt (count unwritable, bound reached) returns
+/// false so the caller falls back to today's touch-and-end behaviour.
+fn skip_touch_within_bound(io_dir: &std::path::Path) -> bool {
+    let path = io_dir.join(SKIP_COUNT_FILE);
+    let count: u32 = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if count >= MAX_SKIPPED_SIGNAL_TOUCHES {
+        eprintln!(
+            "heartbeat-stop: fail-open skipped the signal touch {count} times in a row; touching it to end the run"
+        );
+        return false;
+    }
+    if let Err(e) = std::fs::write(&path, (count + 1).to_string()) {
+        eprintln!(
+            "heartbeat-stop: warning: could not record skip count at {}: {e}; touching signal file",
+            path.display()
+        );
+        return false;
+    }
+    eprintln!(
+        "heartbeat-stop: idle keepalive configured: leaving signal file untouched ({}/{MAX_SKIPPED_SIGNAL_TOUCHES}); next Stop re-delivers",
+        count + 1
+    );
+    true
+}
+
+/// A pass that did not error ends any run of consecutive skips.
+fn clear_skip_count(io_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(io_dir.join(SKIP_COUNT_FILE));
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -167,20 +212,40 @@ fn main() {
                     args.idle_interval, args.idle_interval
                 );
             }
-            let decision = match hook::run(&inbox, &mode, args.idle_interval) {
-                Ok(d) => d,
+            let (decision, hook_errored) = match hook::run(&inbox, &mode, args.idle_interval) {
+                Ok(d) => (d, false),
                 Err(e) => {
                     eprintln!("heartbeat-stop: error: {e}");
                     // Fail-open: approve the stop rather than blocking indefinitely.
-                    hook::Decision::Approve
+                    (hook::Decision::Approve, true)
                 }
+            };
+
+            // Under idle keepalive (heartbeat-launch --idle-timeout > 0 sets
+            // IDLE_KEEPALIVE_ENV for the child), a fail-open Approve must not
+            // touch the signal file: touching it ends the run, and on a queued
+            // soren-headless run that silently drops the rest of the queue.
+            // Leaving it untouched lets the launcher's keepalive start a new
+            // turn, whose Stop re-delivers. Bounded by MAX_SKIPPED_SIGNAL_TOUCHES
+            // consecutive skips so a persistent error still ends the run.
+            // Without keepalive nothing would ever re-fire the hook, so that
+            // path is unchanged: Approve plus signal touch.
+            let keepalive = std::env::var(hook::IDLE_KEEPALIVE_ENV).is_ok_and(|v| v == "1");
+            let io_dir = inbox.parent().unwrap_or(std::path::Path::new("."));
+            let skip_signal_touch = if keepalive && hook_errored {
+                skip_touch_within_bound(io_dir)
+            } else {
+                if keepalive {
+                    clear_skip_count(io_dir);
+                }
+                false
             };
 
             // Signal-file coordination: when the decision is Approve, touch the
             // signal file (if configured) so heartbeat-launch knows to terminate
             // the child's process group. Must happen before we print the approve
             // output so the launcher sees the file before Claude Code exits.
-            if matches!(decision, hook::Decision::Approve) {
+            if matches!(decision, hook::Decision::Approve) && !skip_signal_touch {
                 if let Some(ref sig) = args.signal_file {
                     if let Err(e) = std::fs::OpenOptions::new()
                         .create(true)
