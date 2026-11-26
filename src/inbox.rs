@@ -24,7 +24,7 @@
 
 use crate::error::{HeartbeatError, Result};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// A single entry read from the inbox, including positional metadata.
@@ -209,22 +209,16 @@ pub fn read_offset(offset_file: &Path) -> Result<Option<u64>> {
 
 /// Writes the byte offset to the offset file with fsync for crash safety.
 ///
-/// Uses tmp + fsync + rename for atomicity. All errors map to
+/// Uses a per-writer unique tmp + fsync + rename for atomicity. All errors map to
 /// `OffsetWrite { path, source }` where `path` is the offset file (not the
 /// tmp file) — actionable at 3am.
 pub fn write_offset(offset_file: &Path, offset: u64) -> Result<()> {
-    let tmp = offset_file.with_extension("tmp");
-    let write_err = |e: io::Error| HeartbeatError::OffsetWrite {
-        path: offset_file.to_owned(),
-        source: e,
-    };
-    {
-        let mut f = fs::File::create(&tmp).map_err(write_err)?;
-        write!(f, "{}", offset).map_err(write_err)?;
-        f.sync_all().map_err(write_err)?;
-    }
-    fs::rename(&tmp, offset_file).map_err(write_err)?;
-    Ok(())
+    crate::atomic_write::write_atomic(offset_file, offset.to_string().as_bytes()).map_err(|e| {
+        HeartbeatError::OffsetWrite {
+            path: offset_file.to_owned(),
+            source: e,
+        }
+    })
 }
 
 /// Returns the canonical offset file path for a given inbox path.

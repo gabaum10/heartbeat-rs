@@ -24,7 +24,7 @@
 //!   - live orphan:  cursor == start_offset (never acknowledged)
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -66,26 +66,19 @@ impl InFlightEntry {
         }
     }
 
-    /// Write this entry to `path` atomically (tmp + fsync + rename).
+    /// Write this entry to `path` atomically (unique tmp + fsync + rename).
     pub fn write_to(&self, path: &Path) -> Result<()> {
-        let tmp = path.with_extension("tmp");
         let write_err = |e: io::Error| HeartbeatError::InFlightWrite {
             path: path.to_owned(),
             source: e,
         };
-        {
-            let mut f = fs::File::create(&tmp).map_err(write_err)?;
-            // serde_json::to_string only fails on non-serializable types; our
-            // struct derives Serialize so this is infallible in practice.
-            // Map it to an IO error anyway for the rare edge case.
-            let json = serde_json::to_string(self)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-                .map_err(write_err)?;
-            f.write_all(json.as_bytes()).map_err(write_err)?;
-            f.sync_all().map_err(write_err)?;
-        }
-        fs::rename(&tmp, path).map_err(write_err)?;
-        Ok(())
+        // serde_json::to_string only fails on non-serializable types; our
+        // struct derives Serialize so this is infallible in practice.
+        // Map it to an IO error anyway for the rare edge case.
+        let json = serde_json::to_string(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            .map_err(write_err)?;
+        crate::atomic_write::write_atomic(path, json.as_bytes()).map_err(write_err)
     }
 
     /// Read and parse an `.in-flight` file. Returns `Ok(None)` if the file
@@ -270,19 +263,19 @@ mod tests {
 
     #[test]
     fn write_is_atomic_via_tmp_rename() {
-        // After write, the .in-flight file must exist and the .tmp must not.
+        // After write, the .in-flight file must exist and no temp may remain.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(".in-flight");
-        let tmp = path.with_extension("tmp");
 
         let entry = InFlightEntry::new("atomic test", 0, 12);
         entry.write_to(&path).unwrap();
 
         assert!(path.exists(), ".in-flight must exist after write");
-        assert!(
-            !tmp.exists(),
-            ".in-flight.tmp must be cleaned up after rename"
-        );
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![".in-flight"], "temp must be renamed away");
     }
 
     // -------------------------------------------------------------------------

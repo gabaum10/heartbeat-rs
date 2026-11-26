@@ -4,6 +4,7 @@
 //! binary, and the PTY spawn layer used by the `heartbeat-launch` binary (feature-gated
 //! behind `--features launch`).
 
+pub(crate) mod atomic_write;
 pub mod error;
 pub use error::{HeartbeatError, Result};
 

@@ -92,21 +92,35 @@ pub fn run(inbox_path: &Path, mode: &Mode, idle_interval_secs: u64) -> Result<De
         let in_flight_entry = match InFlightEntry::read_from(&in_flight_path)? {
             Some(entry) => entry,
             None => {
-                // .responded exists but .in-flight is missing. This is an
-                // inconsistent on-disk state — the most likely cause is an
-                // operator manually removing .in-flight to "unstick" a session.
-                // Silently proceeding would re-deliver the entry at the current
-                // cursor position, which the agent already processed.
+                // .responded exists but .in-flight is missing: either an
+                // operator removed .in-flight to "unstick" a session, or a
+                // crash landed between acknowledge()'s .in-flight removal and
+                // the .responded removal below. We can't tell which from disk,
+                // so proceeding silently could re-deliver an entry the agent
+                // already processed. Surface it as an error for this pass.
                 //
-                // Return an error so the failure is visible in stderr. The
-                // hook's fail-open handler in main.rs emits this and approves
-                // the stop. The operator (or launcher startup script) should
-                // run `heartbeat-stop recover` before launching a new session —
-                // recover removes both .in-flight and .responded, fully
-                // clearing this inconsistent state.
-                // InconsistentState carries io_dir so the operator can find
-                // the artifacts that need recovery. The Display impl on
-                // HeartbeatError includes the full recovery instruction.
+                // But clear .responded FIRST. Left in place, the same state
+                // recurs on every later pass (each Err fails open to Approve in
+                // main.rs): it stalls every pass until something runs `recover`.
+                // With the flag cleared, the next pass is an ordinary turn-0
+                // pass: it reads the entry at the cursor and delivers it
+                // (at-least-once: a duplicate is possible, a loss is not).
+                // This pass is still Err, so the inconsistency never becomes
+                // anything but the existing fail-open error path, and a failed
+                // clear returns its own error rather than pretending recovery.
+                match fs::remove_file(&responded_flag) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // InFlightWrite is reused (its Display names the path and
+                    // covers `.responded`) because a new variant would change
+                    // the public error enum.
+                    Err(source) => {
+                        return Err(HeartbeatError::InFlightWrite {
+                            path: responded_flag.clone(),
+                            source,
+                        })
+                    }
+                }
                 return Err(HeartbeatError::InconsistentState {
                     io_dir: io_dir.to_owned(),
                 });
@@ -743,5 +757,57 @@ mod tests {
                 other
             ),
         }
+    }
+
+    /// Item 2 regression: .responded without .in-flight must not recur on every
+    /// pass. The first pass errors (visible, fail-open) AND clears
+    /// .responded; the second pass is an ordinary turn-0 pass that re-delivers
+    /// the entry at the cursor instead of repeating InconsistentState.
+    #[test]
+    fn inconsistent_state_clears_responded_and_second_pass_recovers() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+        write_line(&inbox, "entry K");
+
+        run(&inbox, &Mode::Drain, 0).unwrap();
+        fs::remove_file(in_flight(&dir)).unwrap();
+
+        let first = run(&inbox, &Mode::Drain, 0);
+        assert!(
+            matches!(first, Err(HeartbeatError::InconsistentState { .. })),
+            "first pass must still surface the inconsistency, got {:?}",
+            first
+        );
+        assert!(
+            !responded(&dir).exists(),
+            ".responded must be cleared so the state cannot recur"
+        );
+
+        // Second pass: not the same Err, and not an Approve that drops K.
+        let second = run(&inbox, &Mode::Drain, 0).unwrap();
+        assert_eq!(second, Decision::Block("entry K".to_string()));
+        assert!(in_flight(&dir).exists());
+        assert!(responded(&dir).exists());
+    }
+
+    /// Crash-window variant: cursor already advanced past K, .in-flight gone,
+    /// .responded left behind. Recovery must not re-deliver and not stall.
+    #[test]
+    fn inconsistent_state_after_cursor_advance_does_not_redeliver_or_stall() {
+        let dir = TempDir::new().unwrap();
+        let inbox = make_inbox(&dir);
+        write_line(&inbox, "entry K");
+
+        run(&inbox, &Mode::Drain, 0).unwrap();
+        let inf = InFlightEntry::read_from(&in_flight(&dir)).unwrap().unwrap();
+        // Simulate the crash: acknowledge() finished, .responded not removed.
+        inbox::acknowledge(&offset(&dir), inf.end_offset, &in_flight(&dir)).unwrap();
+        assert!(responded(&dir).exists());
+
+        assert!(matches!(
+            run(&inbox, &Mode::Drain, 0),
+            Err(HeartbeatError::InconsistentState { .. })
+        ));
+        assert_eq!(run(&inbox, &Mode::Drain, 0).unwrap(), Decision::Approve);
     }
 }

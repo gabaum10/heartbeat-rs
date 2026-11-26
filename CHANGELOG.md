@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Offset and `.in-flight` writes no longer share a fixed `<file>.tmp` name.
+  Two processes writing the same directory (hook and launcher) could truncate
+  or rename each other's temp, leaving an empty or missing `.inbox-offset` /
+  `.in-flight`, which surfaced as a fail-open Approve and an exit-signal touch
+  that ends a live run. Each write now uses a temp unique to the writer
+  (pid plus counter, created exclusively, in the same directory so the rename
+  stays atomic) and removes it on failure.
+- `.responded` present without `.in-flight` (an operator removing `.in-flight`,
+  or a crash between the two removals in an acknowledge) used to return
+  `InconsistentState` on every pass until `recover` ran. The hook now clears
+  `.responded` on the pass that detects it and still returns the error for
+  that one pass (fail-open, as before); the next pass is an ordinary turn-0
+  pass and delivers the entry at the cursor. An entry the agent already
+  processed can therefore be delivered again (at-least-once); use `recover`
+  first to drop or dead-letter it instead. The `InconsistentState` message now
+  says this, and the `.in-flight write error` message also covers
+  `.responded`. No public API, CLI flag, or exit code changed.
+
 ## [0.6.0] - 2026-11-05
 
 ### Changed

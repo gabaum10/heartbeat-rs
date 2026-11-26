@@ -307,7 +307,7 @@ heartbeat-stop recover --inbox "$INBOX" --on-orphan retry
 echo "$NEW_WORK" >> "$INBOX"
 ```
 
-**`recover` is the single cleanup point for all inbox-side session artifacts.** On every successful path it removes both `.in-flight` AND `.responded`. Launchers do not need to remove `.responded` separately — calling `recover` before the next session is sufficient:
+**`recover` is the cleanup point for crashed-session artifacts.** On every successful path it removes both `.in-flight` AND `.responded`. (The hook also self-heals one narrow state: `.responded` without `.in-flight` is cleared on the pass that detects it, so it cannot recur; `recover` remains the way to drop or dead-letter an orphan instead of re-delivering it.) Launchers do not need to remove `.responded` separately — calling `recover` before the next session is sufficient:
 
 ```bash
 heartbeat-stop recover --inbox "$INBOX" --on-orphan retry

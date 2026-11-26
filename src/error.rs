@@ -52,17 +52,19 @@ pub enum HeartbeatError {
     },
 
     /// IO error while writing the `.in-flight` file.
-    #[error(".in-flight write error at {path}: {source}")]
+    #[error(".in-flight/.responded write error at {path}: {source}")]
     InFlightWrite {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
 
-    /// `.responded` present without `.in-flight` — recovery state inconsistent.
+    /// `.responded` present without `.in-flight`. The hook has already cleared
+    /// `.responded` when this is returned; the next pass proceeds normally.
     #[error(
         "inconsistent state: .responded present without .in-flight at {io_dir}; \
-         run `heartbeat-stop recover`"
+         .responded has been cleared and the next pass will re-deliver the entry \
+         at the cursor (run `heartbeat-stop recover` first to drop or dead-letter it instead)"
     )]
     InconsistentState { io_dir: PathBuf },
 
