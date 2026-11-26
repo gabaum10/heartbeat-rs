@@ -231,3 +231,120 @@ fn version_flag_prints_version_and_exits_zero() {
         format!("heartbeat-stop {}", env!("CARGO_PKG_VERSION"))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fail-open under idle keepalive (gabaum10/soren#725)
+// ---------------------------------------------------------------------------
+
+const KEEPALIVE_ENV: &str = "HEARTBEAT_IDLE_KEEPALIVE";
+
+/// Run the hook with a signal file; `keepalive` sets the launcher's env var.
+fn run_hook_signal(inbox: &Path, signal: &Path, keepalive: bool) -> Output {
+    let mut cmd = Command::new(binary());
+    cmd.arg("--inbox")
+        .arg(inbox)
+        .arg("--mode")
+        .arg("drain")
+        .arg("--signal-file")
+        .arg(signal);
+    if keepalive {
+        cmd.env(KEEPALIVE_ENV, "1");
+    } else {
+        cmd.env_remove(KEEPALIVE_ENV);
+    }
+    cmd.output().expect("failed to run heartbeat-stop")
+}
+
+/// A persistent hook error: the inbox path is a directory, so every read fails.
+fn broken_inbox(dir: &TempDir) -> PathBuf {
+    let inbox = inbox_path(dir);
+    fs::create_dir(&inbox).unwrap();
+    inbox
+}
+
+#[test]
+fn fail_open_without_keepalive_still_touches_signal() {
+    let dir = TempDir::new().unwrap();
+    let inbox = broken_inbox(&dir);
+    let signal = dir.path().join("exit-signal");
+
+    let out = run_hook_signal(&inbox, &signal, false);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stdout.is_empty(),
+        "fail-open is an Approve: empty stdout"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error"),
+        "the hook must have errored for this test to mean anything"
+    );
+    assert!(
+        signal.exists(),
+        "non-keepalive fail-open must touch the signal"
+    );
+    assert!(
+        !dir.path().join(".fail-open-skips").exists(),
+        "non-keepalive path must not create the skip counter"
+    );
+}
+
+#[test]
+fn fail_open_with_keepalive_skips_signal_touch() {
+    let dir = TempDir::new().unwrap();
+    let inbox = broken_inbox(&dir);
+    let signal = dir.path().join("exit-signal");
+
+    let out = run_hook_signal(&inbox, &signal, true);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty(), "still an Approve: empty stdout");
+    assert!(
+        !signal.exists(),
+        "keepalive fail-open must not touch the signal"
+    );
+}
+
+/// The re-delivery loop bound: a persistent error skips the touch three times
+/// and the fourth consecutive error touches it, ending the run.
+#[test]
+fn fail_open_with_keepalive_persistent_error_is_bounded() {
+    let dir = TempDir::new().unwrap();
+    let inbox = broken_inbox(&dir);
+    let signal = dir.path().join("exit-signal");
+
+    for pass in 1..=3 {
+        run_hook_signal(&inbox, &signal, true);
+        assert!(!signal.exists(), "pass {pass}: skip within the bound");
+    }
+    run_hook_signal(&inbox, &signal, true);
+    assert!(signal.exists(), "pass 4: bound reached, signal touched");
+}
+
+/// A clean pass resets the count: errors, one good pass, then errors again
+/// get a fresh budget.
+#[test]
+fn keepalive_skip_count_resets_on_clean_pass() {
+    let dir = TempDir::new().unwrap();
+    let inbox = broken_inbox(&dir);
+    let signal = dir.path().join("exit-signal");
+
+    for _ in 0..3 {
+        run_hook_signal(&inbox, &signal, true);
+    }
+    assert!(dir.path().join(".fail-open-skips").exists());
+
+    // Repair the inbox; an empty-inbox drain pass is a clean Approve.
+    fs::remove_dir(&inbox).unwrap();
+    fs::write(&inbox, "").unwrap();
+    run_hook_signal(&inbox, &signal, true);
+    assert!(
+        !dir.path().join(".fail-open-skips").exists(),
+        "clean pass clears the counter"
+    );
+    let _ = fs::remove_file(&signal);
+
+    // Break it again: a full budget of skips is available again.
+    fs::remove_file(&inbox).unwrap();
+    fs::create_dir(&inbox).unwrap();
+    run_hook_signal(&inbox, &signal, true);
+    assert!(!signal.exists(), "fresh budget after a clean pass");
+}

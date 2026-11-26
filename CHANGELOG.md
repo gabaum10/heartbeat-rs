@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- A fail-open Approve (the hook errored) under idle keepalive no longer touches
+  the `--signal-file`. Touching it ended the run, and on a queued
+  `soren-headless` run that silently dropped the rest of the queue (launcher
+  exit 0). With the file untouched the session idles, heartbeat-launch's
+  keepalive starts a new turn, and the next Stop re-delivers. `heartbeat-launch`
+  now sets `HEARTBEAT_IDLE_KEEPALIVE=1` in the child's environment when
+  `--idle-timeout > 0` (and removes any inherited value otherwise);
+  `heartbeat-stop` reads it. Bounded: after 3 consecutive skipped touches
+  (counted in `.fail-open-skips` beside the inbox, cleared by any pass that
+  does not error) the next error touches the file and ends the run as before,
+  so a persistent error cannot loop. Without the variable (no keepalive) the
+  fail-open path is unchanged: Approve plus signal touch. Because the variable
+  comes from the launcher, no hook command or settings change is needed.
+  Each skip costs one real keepalive turn (up to 3 per persistent error), and
+  `--max-idle-retries` below 3 can end the run first (exit 125).
 - Offset and `.in-flight` writes no longer share a fixed `<file>.tmp` name.
   Two processes writing the same directory (hook and launcher) could truncate
   or rename each other's temp, leaving an empty or missing `.inbox-offset` /
