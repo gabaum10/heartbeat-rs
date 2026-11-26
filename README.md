@@ -366,7 +366,7 @@ heartbeat-stop recover --inbox "$INBOX" --on-orphan deadletter
 
 **Signal file paths must be unique per session.** If you use `--exit-signal` or `--signal-file`, include the session directory in the path (e.g. `$AGENT_DIR/.exit-signal`) rather than a fixed path like `/tmp/heartbeat-stop`. Two sessions sharing a signal file path will interfere: one session's stop signal triggers the other's shutdown.
 
-**Fail-open under idle keepalive.** When the hook errors it fails open to Approve and touches the signal file. If `heartbeat-launch` runs with `--idle-timeout > 0` (it then sets `HEARTBEAT_IDLE_KEEPALIVE=1` for the child), the touch is skipped instead, so the keepalive starts a new turn and the next Stop re-delivers rather than ending the run. After 3 consecutive skips (`.fail-open-skips` beside the inbox; any non-error pass clears it) the next error touches the file as usual. Without keepalive the behaviour is unchanged.
+**Fail-open under idle keepalive.** When the hook errors it fails open to Approve and touches the signal file. If `heartbeat-launch` runs with `--idle-timeout > 0` (it then sets `HEARTBEAT_IDLE_KEEPALIVE=1` for the child), the touch is skipped instead, so the keepalive starts a new turn and the next Stop re-delivers rather than ending the run. After 3 consecutive skips (`.fail-open-skips` beside the inbox; any non-error pass clears it) the next error touches the file as usual. Without keepalive the behaviour is unchanged. Each skip is paid for with a real keepalive turn, so a turn that repeats side effects can run up to 3 extra times on a persistent error. If `--max-idle-retries` is below 3 and those turns finish inside the 20s grace window, the launcher's retry limit can end the run first (exit 125).
 
 ## Use Cases
 

@@ -19,6 +19,8 @@ All notable changes to this project will be documented in this file.
   so a persistent error cannot loop. Without the variable (no keepalive) the
   fail-open path is unchanged: Approve plus signal touch. Because the variable
   comes from the launcher, no hook command or settings change is needed.
+  Each skip costs one real keepalive turn (up to 3 per persistent error), and
+  `--max-idle-retries` below 3 can end the run first (exit 125).
 - Offset and `.in-flight` writes no longer share a fixed `<file>.tmp` name.
   Two processes writing the same directory (hook and launcher) could truncate
   or rename each other's temp, leaving an empty or missing `.inbox-offset` /
